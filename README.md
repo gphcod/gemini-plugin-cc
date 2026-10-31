@@ -9,13 +9,20 @@ Claude Code calls Gemini through the [Antigravity CLI](https://antigravity.googl
 ## Installation
 
 ```text
-/plugin marketplace add m-ghalib/gemini-plugin-cc
+/plugin marketplace add gphcod/gemini-plugin-cc
 /plugin install gemini@gemini-plugin-cc
 /reload-plugins
 /gemini:setup --verify
 ```
 
 `/reload-plugins` refreshes files the loader already knows. After installing or upgrading to a version that adds or removes commands or skills, start a new Claude Code session.
+
+If you installed 1.x from `m-ghalib/gemini-plugin-cc`, which still runs the retired Gemini CLI, remove it first. Both marketplaces are named `gemini-plugin-cc`.
+
+```text
+/plugin uninstall gemini@gemini-plugin-cc
+/plugin marketplace remove gemini-plugin-cc
+```
 
 ## Prerequisites
 

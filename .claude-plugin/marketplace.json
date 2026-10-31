@@ -1,8 +1,8 @@
 {
   "name": "gemini-plugin-cc",
   "owner": {
-    "name": "Momin Abrar Ghalib",
-    "url": "https://github.com/m-ghalib"
+    "name": "gphcod",
+    "url": "https://github.com/gphcod"
   },
   "metadata": {
     "description": "Gemini plugin for Claude Code: code review and delegation through the Antigravity CLI (agy).",
