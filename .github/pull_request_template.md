@@ -17,7 +17,7 @@
 ## Test Plan
 
 - [ ] `npm test` passes
-- [ ] `npm run build` passes
+- [ ] `npm run test:live` passes (for changes to the agy runner or prompts; needs a signed-in agy)
 - [ ] Manually tested the affected command(s)
 
 <!-- Add specific test steps if this touches runtime behavior. -->

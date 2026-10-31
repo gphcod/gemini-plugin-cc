@@ -1,37 +1,14 @@
 ---
-description: Check whether the local Gemini CLI is ready and optionally toggle the stop-time review gate
+description: Check that the Antigravity CLI (agy) is installed and signed in, and toggle the stop-time review gate
 argument-hint: '[--verify] [--enable-review-gate|--disable-review-gate]'
-allowed-tools: Bash(node:*), Bash(npm:*), AskUserQuestion
+disable-model-invocation: true
+allowed-tools: Bash(node:*)
 ---
 
-Run:
+Run once with Bash:
 
 ```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/gemini-companion.mjs" setup --json $ARGUMENTS
+node "${CLAUDE_PLUGIN_ROOT}/scripts/gemini-companion.mjs" setup "$ARGUMENTS"
 ```
 
-If the result says Gemini is unavailable and npm is available:
-- Use `AskUserQuestion` exactly once to ask whether Claude should install Gemini CLI now.
-- Put the install option first and suffix it with `(Recommended)`.
-- Use these two options:
-  - `Install Gemini CLI (Recommended)`
-  - `Skip for now`
-- If the user chooses install, run:
-
-```bash
-npm install -g @google/gemini-cli@0.38.2
-```
-
-- Then rerun:
-
-```bash
-node "${CLAUDE_PLUGIN_ROOT}/scripts/gemini-companion.mjs" setup --json $ARGUMENTS
-```
-
-If Gemini is already installed or npm is unavailable:
-- Do not ask about installation.
-
-Output rules:
-- Present the final setup output to the user.
-- If installation was skipped, present the original setup output.
-- If Gemini is installed but not authenticated, preserve the guidance to configure auth in `~/.gemini/settings.json` or run `gemini auth` in a terminal outside Claude Code. Do not suggest running auth commands via Claude's `!` prefix — the auth flow is interactive and requires a browser.
+Report the result. Exit 1 means not ready: give the next step it names. Sign-in is interactive, so the user runs `agy` once in their own terminal, not through `!`.

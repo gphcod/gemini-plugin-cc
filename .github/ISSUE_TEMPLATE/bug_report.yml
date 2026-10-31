@@ -29,11 +29,11 @@ body:
       required: true
 
   - type: input
-    id: gemini-version
+    id: agy-version
     attributes:
-      label: Gemini CLI Version
-      description: Output of `gemini --version`
-      placeholder: "0.38.2"
+      label: Antigravity CLI Version
+      description: Output of `agy --version`
+      placeholder: "1.4.12"
     validations:
       required: true
 

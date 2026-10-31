@@ -1,27 +1,13 @@
 import fs from "node:fs";
 
-import { getSessionRuntimeStatus } from "./gemini.mjs";
-import { getConfig, listJobs, readJobFile, resolveJobFile } from "./state.mjs";
-import { SESSION_ID_ENV } from "./tracked-jobs.mjs";
+import { deriveJobState, getConfig, listJobs, readJobResult, resolveJobFile } from "./state.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
-export const DEFAULT_MAX_STATUS_JOBS = 8;
+export const DEFAULT_MAX_STATUS_JOBS = 10;
 export const DEFAULT_MAX_PROGRESS_LINES = 4;
 
 export function sortJobsNewestFirst(jobs) {
   return [...jobs].sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")));
-}
-
-function getCurrentSessionId(options = {}) {
-  return options.env?.[SESSION_ID_ENV] ?? process.env[SESSION_ID_ENV] ?? null;
-}
-
-function filterJobsForCurrentSession(jobs, options = {}) {
-  const sessionId = getCurrentSessionId(options);
-  if (!sessionId) {
-    return jobs;
-  }
-  return jobs.filter((job) => job.sessionId === sessionId);
 }
 
 function getJobTypeLabel(job) {
@@ -31,17 +17,11 @@ function getJobTypeLabel(job) {
   if (job.kind === "adversarial-review") {
     return "adversarial-review";
   }
-  if (job.jobClass === "review") {
+  if (job.jobClass === "review" || job.kind === "review") {
     return "review";
   }
-  if (job.jobClass === "task") {
-    return "rescue";
-  }
-  if (job.kind === "review") {
-    return "review";
-  }
-  if (job.kind === "task") {
-    return "rescue";
+  if (job.jobClass === "task" || job.kind === "task") {
+    return "task";
   }
   return "job";
 }
@@ -51,11 +31,7 @@ function stripLogPrefix(line) {
 }
 
 function isProgressBlockTitle(line) {
-  return (
-    ["Final output", "Assistant message", "Reasoning summary", "Review output"].includes(line) ||
-    /^Subagent .+ message$/.test(line) ||
-    /^Subagent .+ reasoning summary$/.test(line)
-  );
+  return ["Final output", "Assistant message", "Review output"].includes(line);
 }
 
 export function readJobProgressPreview(logFile, maxLines = DEFAULT_MAX_PROGRESS_LINES) {
@@ -100,98 +76,63 @@ function formatElapsedDuration(startValue, endValue = null) {
   return `${seconds}s`;
 }
 
-function looksLikeVerificationCommand(line) {
-  return /\b(test|tests|lint|build|typecheck|type-check|check|verify|validate|pytest|jest|vitest|cargo test|npm test|pnpm test|yarn test|go test|mvn test|gradle test|tsc|eslint|ruff)\b/i.test(
-    line
-  );
+export function isActiveJobStatus(status) {
+  return status === "queued" || status === "running";
 }
 
-function inferLegacyJobPhase(job, progressPreview = []) {
-  switch (job.status) {
-    case "queued":
-      return "queued";
-    case "cancelled":
-      return "cancelled";
-    case "failed":
-      return "failed";
-    case "completed":
-      return "done";
-    default:
-      break;
+// listJobs() derives `stalled`: the job claims to be active but its companion
+// is gone, e.g. a foreground run whose Bash call hit its timeout.
+export function isJobStalled(job, now = Date.now()) {
+  if (!isActiveJobStatus(job.status)) {
+    return false;
   }
-
-  for (let index = progressPreview.length - 1; index >= 0; index -= 1) {
-    const line = progressPreview[index].toLowerCase();
-    if (line.startsWith("starting gemini") || line.startsWith("thread ready") || line.startsWith("turn started")) {
-      return "starting";
-    }
-    if (line.startsWith("reviewer started") || line.includes("review mode")) {
-      return "reviewing";
-    }
-    if (line.startsWith("searching:") || line.startsWith("calling ") || line.startsWith("running tool:")) {
-      return "investigating";
-    }
-    if (line.startsWith("starting collaboration tool:")) {
-      return "investigating";
-    }
-    if (line.startsWith("running command:")) {
-      return looksLikeVerificationCommand(line)
-        ? "verifying"
-        : job.jobClass === "review"
-          ? "reviewing"
-          : "investigating";
-    }
-    if (line.startsWith("command completed:")) {
-      return looksLikeVerificationCommand(line) ? "verifying" : "running";
-    }
-    if (line.startsWith("applying ") || line.startsWith("file changes ")) {
-      return "editing";
-    }
-    if (line.startsWith("turn completed")) {
-      return "finalizing";
-    }
-    if (line.startsWith("gemini error:") || line.startsWith("failed:")) {
-      return "failed";
-    }
-  }
-
-  return job.jobClass === "review" ? "reviewing" : "running";
+  return typeof job.stalled === "boolean" ? job.stalled : Boolean(deriveJobState(job, null, now).stalled);
 }
 
 export function enrichJob(job, options = {}) {
   const maxProgressLines = options.maxProgressLines ?? DEFAULT_MAX_PROGRESS_LINES;
-  const enriched = {
+  const stalled = isJobStalled(job);
+  return {
     ...job,
     kindLabel: getJobTypeLabel(job),
-    progressPreview:
-      job.status === "queued" || job.status === "running" || job.status === "failed"
-        ? readJobProgressPreview(job.logFile, maxProgressLines)
-        : [],
+    stalled,
+    displayStatus: stalled ? "stalled" : job.status,
+    progressPreview: isActiveJobStatus(job.status) || job.status === "failed"
+      ? readJobProgressPreview(job.logFile, maxProgressLines)
+      : [],
     elapsed: formatElapsedDuration(job.startedAt ?? job.createdAt, job.completedAt ?? null),
     duration:
       job.status === "completed" || job.status === "failed" || job.status === "cancelled"
         ? formatElapsedDuration(job.startedAt ?? job.createdAt, job.completedAt ?? job.updatedAt)
-        : null
-  };
-
-  return {
-    ...enriched,
-    phase: enriched.phase ?? inferLegacyJobPhase(enriched, enriched.progressPreview)
+        : null,
+    phase: job.phase ?? (isActiveJobStatus(job.status) ? "running" : job.status)
   };
 }
 
+// The job record merged with its final payload (rendered output, result).
 export function readStoredJob(workspaceRoot, jobId) {
   const jobFile = resolveJobFile(workspaceRoot, jobId);
   if (!fs.existsSync(jobFile)) {
     return null;
   }
-  return readJobFile(jobFile);
+  const record = listJobs(workspaceRoot).find((job) => job.id === jobId) ?? JSON.parse(fs.readFileSync(jobFile, "utf8"));
+  return { ...record, ...(readJobResult(workspaceRoot, jobId) ?? {}) };
 }
 
-function matchJobReference(jobs, reference, predicate = () => true) {
+// References match the 4-character handle first, then the full id, then a
+// unique id prefix.
+export function matchJobReference(jobs, reference, predicate = () => true) {
   const filtered = jobs.filter(predicate);
   if (!reference) {
     return filtered[0] ?? null;
+  }
+
+  const byHandle = filtered.filter((job) => job.handle === reference);
+  if (byHandle.length === 1) {
+    return byHandle[0];
+  }
+  if (byHandle.length > 1) {
+    throw new Error(`Job handle "${reference}" is ambiguous. Use the full job id.`);
   }
 
   const exact = filtered.find((job) => job.id === reference);
@@ -213,28 +154,24 @@ function matchJobReference(jobs, reference, predicate = () => true) {
 export function buildStatusSnapshot(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const config = getConfig(workspaceRoot);
-  const allJobs = listJobs(workspaceRoot);
-  const jobs = sortJobsNewestFirst(
-    options.all ? allJobs : filterJobsForCurrentSession(allJobs, options)
-  );
+  const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
   const maxJobs = options.maxJobs ?? DEFAULT_MAX_STATUS_JOBS;
   const maxProgressLines = options.maxProgressLines ?? DEFAULT_MAX_PROGRESS_LINES;
 
   const running = jobs
-    .filter((job) => job.status === "queued" || job.status === "running")
+    .filter((job) => isActiveJobStatus(job.status))
     .map((job) => enrichJob(job, { maxProgressLines }));
 
-  const latestFinishedRaw = jobs.find((job) => job.status !== "queued" && job.status !== "running") ?? null;
+  const latestFinishedRaw = jobs.find((job) => !isActiveJobStatus(job.status)) ?? null;
   const latestFinished = latestFinishedRaw ? enrichJob(latestFinishedRaw, { maxProgressLines }) : null;
 
   const recent = (options.all ? jobs : jobs.slice(0, maxJobs))
-    .filter((job) => job.status !== "queued" && job.status !== "running" && job.id !== latestFinished?.id)
+    .filter((job) => !isActiveJobStatus(job.status) && job.id !== latestFinished?.id)
     .map((job) => enrichJob(job, { maxProgressLines }));
 
   return {
     workspaceRoot,
     config,
-    sessionRuntime: getSessionRuntimeStatus(options.env, workspaceRoot),
     running,
     latestFinished,
     recent,
@@ -258,7 +195,7 @@ export function buildSingleJobSnapshot(cwd, reference, options = {}) {
 
 export function resolveResultJob(cwd, reference) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const jobs = sortJobsNewestFirst(reference ? listJobs(workspaceRoot) : filterJobsForCurrentSession(listJobs(workspaceRoot)));
+  const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
 
   if (!reference) {
     const latestFinished = jobs.find(
@@ -271,17 +208,17 @@ export function resolveResultJob(cwd, reference) {
   }
 
   const selected = matchJobReference(jobs, reference);
-  if (selected.status === "queued" || selected.status === "running") {
-    throw new Error(`Job ${selected.id} is still ${selected.status}. Check /gemini:status and try again once it finishes.`);
+  if (isActiveJobStatus(selected.status) && !isJobStalled(selected)) {
+    throw new Error(`Job ${selected.handle ?? selected.id} is still ${selected.status}. Check /gemini:status and try again once it finishes.`);
   }
 
   return { workspaceRoot, job: selected };
 }
 
-export function resolveCancelableJob(cwd, reference, options = {}) {
+export function resolveCancelableJob(cwd, reference) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
-  const activeJobs = jobs.filter((job) => job.status === "queued" || job.status === "running");
+  const activeJobs = jobs.filter((job) => isActiveJobStatus(job.status));
 
   if (reference) {
     const selected = matchJobReference(activeJobs, reference);
@@ -291,43 +228,27 @@ export function resolveCancelableJob(cwd, reference, options = {}) {
     return { workspaceRoot, job: selected };
   }
 
-  const sessionScopedActiveJobs = filterJobsForCurrentSession(activeJobs, options);
-
-  if (sessionScopedActiveJobs.length === 1) {
-    return { workspaceRoot, job: sessionScopedActiveJobs[0] };
+  if (activeJobs.length === 1) {
+    return { workspaceRoot, job: activeJobs[0] };
   }
-  if (sessionScopedActiveJobs.length > 1) {
-    throw new Error("Multiple Gemini jobs are active. Pass a job id to /gemini:cancel.");
-  }
-
-  if (getCurrentSessionId(options)) {
-    throw new Error("No active Gemini jobs to cancel for this session.");
+  if (activeJobs.length > 1) {
+    throw new Error("Multiple Gemini jobs are active. Pass a job handle to /gemini:cancel.");
   }
 
   throw new Error("No active Gemini jobs to cancel.");
 }
 
-export function resolveWaitTargetJob(cwd, options = {}) {
+export function resolveWaitTargetJob(cwd) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
-  const activeJobs = jobs.filter((job) => job.status === "queued" || job.status === "running");
+  const activeJobs = jobs.filter((job) => isActiveJobStatus(job.status) && !isJobStalled(job));
 
-  const scopedActiveJobs = options.all
-    ? activeJobs
-    : filterJobsForCurrentSession(activeJobs, options);
-
-  if (scopedActiveJobs.length === 1) {
-    return { workspaceRoot, job: scopedActiveJobs[0] };
+  if (activeJobs.length === 1) {
+    return { workspaceRoot, job: activeJobs[0] };
   }
-  if (scopedActiveJobs.length > 1) {
-    throw new Error("Multiple Gemini jobs are active. Pass a job ID to `status --wait`.");
+  if (activeJobs.length > 1) {
+    throw new Error("Multiple Gemini jobs are active. Pass a job handle to wait on.");
   }
 
-  if (options.all) {
-    throw new Error("No active Gemini jobs to wait on.");
-  }
-  if (getCurrentSessionId(options)) {
-    throw new Error("No active Gemini jobs to wait on for this session. Use `--all` to include other sessions.");
-  }
   throw new Error("No active Gemini jobs to wait on.");
 }

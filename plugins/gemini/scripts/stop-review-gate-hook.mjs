@@ -1,22 +1,27 @@
 #!/usr/bin/env node
 
+// Optional Stop hook: when the review gate is enabled for this workspace,
+// a read-only Gemini turn reviews Claude's last turn and can block the stop.
+// Gate runs are tagged with --stop-gate so they never become resume targets.
+
 import fs from "node:fs";
 import process from "node:process";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-import { getGeminiAvailability, getGeminiAuthStatus, cleanGeminiStderr } from "./lib/gemini.mjs";
+import { binaryAvailable } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import { getConfig, listJobs } from "./lib/state.mjs";
-import { sortJobsNewestFirst } from "./lib/job-control.mjs";
-import { SESSION_ID_ENV } from "./lib/tracked-jobs.mjs";
+import { isActiveJobStatus, isJobStalled, sortJobsNewestFirst } from "./lib/job-control.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
-const STOP_REVIEW_TIMEOUT_MS = 15 * 60 * 1000;
+// Inner budget stays well under the hook's 900 s timeout so the hook always
+// gets to emit its decision.
+const GATE_AGY_TIMEOUT_SECONDS = 600;
+const GATE_PROCESS_TIMEOUT_MS = 720 * 1000;
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(SCRIPT_DIR, "..");
-const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
 
 function readHookInput() {
   const raw = fs.readFileSync(0, "utf8").trim();
@@ -31,21 +36,12 @@ function emitDecision(payload) {
 }
 
 function logNote(message) {
-  if (!message) {
-    return;
+  if (message) {
+    process.stderr.write(`${message}\n`);
   }
-  process.stderr.write(`${message}\n`);
 }
 
-function filterJobsForCurrentSession(jobs, input = {}) {
-  const sessionId = input.session_id || process.env[SESSION_ID_ENV] || null;
-  if (!sessionId) {
-    return jobs;
-  }
-  return jobs.filter((job) => job.sessionId === sessionId);
-}
-
-function buildStopReviewPrompt(input = {}) {
+export function buildStopReviewPrompt(input = {}) {
   const lastAssistantMessage = String(input.last_assistant_message ?? "").trim();
   const template = loadPromptTemplate(ROOT_DIR, "stop-review-gate");
   const claudeResponseBlock = lastAssistantMessage
@@ -56,91 +52,21 @@ function buildStopReviewPrompt(input = {}) {
   });
 }
 
-async function buildSetupNote(cwd) {
-  const availability = getGeminiAvailability(cwd);
-  if (!availability.available) {
-    const detail = availability.detail ? ` ${availability.detail}.` : "";
-    return `Gemini is not set up for the review gate.${detail} Run /gemini:setup.`;
-  }
-
-  const auth = await getGeminiAuthStatus(cwd);
-  if (!auth.loggedIn) {
-    const guidance = auth.authMethod
-      ? `Auth type "${auth.authMethod}" is configured but credentials are missing or expired.`
-      : "No auth type is configured.";
-    return `Gemini review gate cannot run: ${guidance} ${auth.detail ?? ""} Run /gemini:setup to diagnose and fix auth.`.trim();
-  }
-
-  return null;
-}
-
-function sanitizeErrorDetail(rawDetail) {
-  let text = cleanGeminiStderr(rawDetail);
-
-  try {
-    const parsed = JSON.parse(text);
-    if (typeof parsed?.message === "string") {
-      text = parsed.message;
-    } else if (typeof parsed?.error?.message === "string") {
-      text = parsed.error.message;
-    }
-  } catch {
-    // Not JSON, use as-is
-  }
-
-  text = text
+function shortenDetail(rawDetail) {
+  const text = String(rawDetail ?? "")
     .split(/\r?\n/)
-    .filter((line) => !line.match(/^\s+at /))
-    .join("\n")
+    .filter((line) => line.trim() && !/^\s+at /.test(line))
+    .join(" ")
     .trim();
-
-  if (text.length > 300) {
-    text = text.slice(0, 297) + "...";
-  }
-
-  return text;
+  return text.length > 300 ? `${text.slice(0, 297)}...` : text;
 }
 
-function classifyFailure(detail) {
-  const lower = detail.toLowerCase();
-  if (lower.includes("token") && (lower.includes("expired") || lower.includes("invalid"))) {
-    return "oauth-expired";
-  }
-  if (lower.includes("oauth") && (lower.includes("refresh") || lower.includes("expired"))) {
-    return "oauth-expired";
-  }
-  if (lower.includes("econnrefused") || lower.includes("connection refused")) {
-    return "connection-refused";
-  }
-  if (lower.includes("enotfound") || lower.includes("getaddrinfo")) {
-    return "dns-failure";
-  }
-  if (lower.includes("401") || lower.includes("unauthorized")) {
-    return "auth-rejected";
-  }
-  return "generic";
-}
-
-function buildFailureGuidance(classification) {
-  switch (classification) {
-    case "oauth-expired":
-    case "auth-rejected":
-      return "Run `/gemini:setup` to diagnose and fix auth, or run `gemini auth` in a terminal outside Claude Code.";
-    case "connection-refused":
-    case "dns-failure":
-      return "Check network connectivity or gateway configuration.";
-    default:
-      return "Run /gemini:review --wait manually or bypass the gate.";
-  }
-}
-
-function parseStopReviewOutput(rawOutput) {
+export function parseStopReviewOutput(rawOutput) {
   const text = String(rawOutput ?? "").trim();
   if (!text) {
     return {
       ok: false,
-      reason:
-        "The stop-time Gemini review task returned no final output. Run /gemini:review --wait manually or bypass the gate."
+      reason: "The stop-time Gemini review returned no output. Run /gemini:review --wait manually or disable the gate with /gemini:setup --disable-review-gate."
     };
   }
 
@@ -158,56 +84,53 @@ function parseStopReviewOutput(rawOutput) {
 
   return {
     ok: false,
-    reason:
-      "The stop-time Gemini review task returned an unexpected answer. Run /gemini:review --wait manually or bypass the gate."
+    reason: "The stop-time Gemini review returned an unexpected answer. Run /gemini:review --wait manually or disable the gate with /gemini:setup --disable-review-gate."
   };
 }
 
 function runStopReview(cwd, input = {}) {
   const scriptPath = path.join(SCRIPT_DIR, "gemini-companion.mjs");
-  const prompt = buildStopReviewPrompt(input);
-  const childEnv = {
-    ...process.env,
-    ...(input.session_id ? { [SESSION_ID_ENV]: input.session_id } : {})
-  };
-  const result = spawnSync(process.execPath, [scriptPath, "task", "--plan", "--json", prompt], {
-    cwd,
-    env: childEnv,
-    encoding: "utf8",
-    timeout: STOP_REVIEW_TIMEOUT_MS
-  });
+  const result = spawnSync(
+    process.execPath,
+    [scriptPath, "task", "--plan", "--stop-gate", "--json", "--timeout", String(GATE_AGY_TIMEOUT_SECONDS)],
+    {
+      cwd,
+      env: process.env,
+      encoding: "utf8",
+      input: buildStopReviewPrompt(input),
+      timeout: GATE_PROCESS_TIMEOUT_MS
+    }
+  );
 
   if (result.error?.code === "ETIMEDOUT") {
     return {
       ok: false,
-      reason:
-        "The stop-time Gemini review task timed out after 15 minutes. Run /gemini:review --wait manually or bypass the gate."
+      reason: "The stop-time Gemini review timed out. Run /gemini:review --wait manually or disable the gate with /gemini:setup --disable-review-gate."
     };
+  }
+
+  let payload = null;
+  try {
+    payload = JSON.parse(result.stdout);
+  } catch {
+    payload = null;
   }
 
   if (result.status !== 0) {
-    const rawDetail = String(result.stderr || result.stdout || "").trim();
-    const sanitized = sanitizeErrorDetail(rawDetail);
-    const classification = classifyFailure(sanitized);
-    const guidance = buildFailureGuidance(classification);
+    const detail = shortenDetail(payload?.error ?? payload?.message ?? result.stderr ?? result.stdout);
     return {
       ok: false,
-      reason: sanitized
-        ? `The stop-time Gemini review task failed: ${sanitized}. ${guidance}`
-        : `The stop-time Gemini review task failed. ${guidance}`
+      reason: `The stop-time Gemini review failed${detail ? `: ${detail}` : "."} Run /gemini:setup to check agy, or disable the gate with /gemini:setup --disable-review-gate.`
     };
   }
 
-  try {
-    const payload = JSON.parse(result.stdout);
-    return parseStopReviewOutput(payload?.rawOutput);
-  } catch {
+  if (!payload) {
     return {
       ok: false,
-      reason:
-        "The stop-time Gemini review task returned invalid JSON. Run /gemini:review --wait manually or bypass the gate."
+      reason: "The stop-time Gemini review returned invalid JSON. Run /gemini:review --wait manually or disable the gate with /gemini:setup --disable-review-gate."
     };
   }
+  return parseStopReviewOutput(payload.rawOutput);
 }
 
 async function main() {
@@ -216,24 +139,27 @@ async function main() {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const config = getConfig(workspaceRoot);
 
-  const jobs = sortJobsNewestFirst(filterJobsForCurrentSession(listJobs(workspaceRoot), input));
-  const runningJob = jobs.find((job) => job.status === "queued" || job.status === "running");
+  const runningJob = sortJobsNewestFirst(listJobs(workspaceRoot)).find(
+    (job) => isActiveJobStatus(job.status) && !isJobStalled(job) && !job.stopGate
+  );
   const runningTaskNote = runningJob
-    ? `Gemini task ${runningJob.id} is still running. Check /gemini:status and use /gemini:cancel ${runningJob.id} if you want to stop it before ending the session.`
+    ? `Gemini job ${runningJob.handle ?? runningJob.id} is still running. Check /gemini:status, or /gemini:cancel ${runningJob.handle ?? runningJob.id} to stop it.`
     : null;
 
-  if (!config.stopReviewGate) {
+  // Claude is already continuing because of an earlier block from this hook:
+  // review once per stop cycle so a persistent BLOCK cannot loop forever.
+  if (!config.stopReviewGate || input.stop_hook_active) {
     logNote(runningTaskNote);
     return;
   }
 
-  const setupNote = await buildSetupNote(cwd);
-  if (setupNote) {
-    const parts = [setupNote];
-    if (runningTaskNote) parts.push(runningTaskNote);
+  if (!binaryAvailable("agy", ["--version"], { cwd }).available) {
     emitDecision({
       decision: "block",
-      reason: parts.join(" ")
+      reason: [
+        "The Gemini review gate is enabled but agy is not installed. Run /gemini:setup, or disable the gate with /gemini:setup --disable-review-gate.",
+        runningTaskNote
+      ].filter(Boolean).join(" ")
     });
     return;
   }
@@ -242,7 +168,7 @@ async function main() {
   if (!review.ok) {
     emitDecision({
       decision: "block",
-      reason: runningTaskNote ? `${runningTaskNote} ${review.reason}` : review.reason
+      reason: [runningTaskNote, review.reason].filter(Boolean).join(" ")
     });
     return;
   }
@@ -250,8 +176,10 @@ async function main() {
   logNote(runningTaskNote);
 }
 
-main().catch((error) => {
-  const message = error instanceof Error ? error.message : String(error);
-  process.stderr.write(`${message}\n`);
-  process.exitCode = 1;
-});
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch((error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    process.stderr.write(`${message}\n`);
+    process.exitCode = 1;
+  });
+}

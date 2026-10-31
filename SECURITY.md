@@ -19,7 +19,7 @@ You should receive a response within 72 hours. We will work with you to understa
 
 This policy covers the `gemini-plugin-cc` plugin code, including:
 
-- ACP client and broker lifecycle
+- The agy runner (`scripts/lib/agy.mjs`) and process-tree cleanup
 - Auth discovery and credential handling
 - Stop-hook review gate
 - Job state management
@@ -27,7 +27,7 @@ This policy covers the `gemini-plugin-cc` plugin code, including:
 
 ## Out of Scope
 
-- Vulnerabilities in the Gemini CLI itself (report to [Google](https://github.com/google-gemini/gemini-cli))
+- Vulnerabilities in the Antigravity CLI (`agy`) itself (report to Google)
 - Vulnerabilities in Claude Code (report to [Anthropic](https://github.com/anthropics/claude-code))
 - Issues with third-party dependencies not shipped by this plugin
 

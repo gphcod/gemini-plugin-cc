@@ -132,7 +132,8 @@ test("collectReviewContext falls back to lightweight context for larger adversar
   fs.writeFileSync(path.join(cwd, "c.js"), 'export const value = "SELF_COLLECT_MARKER_C";\n');
 
   const target = resolveReviewTarget(cwd, {});
-  const context = collectReviewContext(cwd, target);
+  assert.equal(collectReviewContext(cwd, target).inputMode, "inline-diff");
+  const context = collectReviewContext(cwd, target, { maxInlineFiles: 2 });
 
   assert.equal(context.inputMode, "self-collect");
   assert.equal(context.fileCount, 3);
@@ -173,7 +174,7 @@ test("collectReviewContext keeps untracked file content in lightweight working t
   fs.writeFileSync(path.join(cwd, "new-risk.js"), 'export const value = "UNTRACKED_RISK_MARKER";\n');
 
   const target = resolveReviewTarget(cwd, {});
-  const context = collectReviewContext(cwd, target);
+  const context = collectReviewContext(cwd, target, { maxInlineFiles: 2 });
 
   assert.equal(context.inputMode, "self-collect");
   assert.equal(context.fileCount, 3);

@@ -5,14 +5,14 @@
     "url": "https://github.com/m-ghalib"
   },
   "metadata": {
-    "description": "Gemini plugin to use in Claude Code for delegation and code review.",
-    "version": "1.0.0"
+    "description": "Gemini plugin for Claude Code: code review and delegation through the Antigravity CLI (agy).",
+    "version": "2.0.0"
   },
   "plugins": [
     {
       "name": "gemini",
-      "description": "Use Gemini from Claude Code to review code or delegate tasks.",
-      "version": "1.0.0",
+      "description": "Use Gemini from Claude Code through the Antigravity CLI (agy) to review code or delegate tasks.",
+      "version": "2.0.0",
       "author": {
         "name": "Momin Abrar Ghalib"
       },

@@ -1,79 +1,90 @@
+import path from "node:path";
+import process from "node:process";
 import test from "node:test";
 import assert from "node:assert/strict";
-import fs from "node:fs";
-import path from "node:path";
 import { spawnSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
 
-import { makeTempDir } from "./helpers.mjs";
-import { saveState, resolveStateDir } from "../plugins/gemini/scripts/lib/state.mjs";
+import { makeFakeAgyWorkspace, PLUGIN_ROOT, readArgvLog, runCompanion } from "./helpers.mjs";
 
-const HOOK_SCRIPT = path.resolve(
-  path.dirname(fileURLToPath(import.meta.url)),
-  "../plugins/gemini/scripts/stop-review-gate-hook.mjs"
-);
+const HOOK_SCRIPT = path.join(PLUGIN_ROOT, "scripts", "stop-review-gate-hook.mjs");
 
-function runHook(workspace, { gateEnabled = false, geminiAvailable = false } = {}) {
-  const pluginDataDir = path.join(workspace, ".plugin-data");
-  fs.mkdirSync(pluginDataDir, { recursive: true });
-
-  const origEnv = process.env.CLAUDE_PLUGIN_DATA;
-  process.env.CLAUDE_PLUGIN_DATA = pluginDataDir;
-  try {
-    saveState(workspace, { config: { stopReviewGate: gateEnabled }, jobs: [] });
-  } finally {
-    if (origEnv === undefined) delete process.env.CLAUDE_PLUGIN_DATA;
-    else process.env.CLAUDE_PLUGIN_DATA = origEnv;
-  }
-
-  const binDir = path.join(workspace, "bin");
-  fs.mkdirSync(binDir, { recursive: true });
-  if (geminiAvailable) {
-    const script = '#!/bin/sh\necho "1.0.0"';
-    const binPath = path.join(binDir, "gemini");
-    fs.writeFileSync(binPath, script);
-    fs.chmodSync(binPath, 0o755);
-  }
-
-  const hookInput = JSON.stringify({ cwd: workspace });
-
-  const envPath = geminiAvailable
-    ? `${binDir}:${process.env.PATH}`
-    : "/usr/bin:/bin";
-
+function runHook(ws, { scenario, input = {} } = {}) {
   const result = spawnSync(process.execPath, [HOOK_SCRIPT], {
-    cwd: workspace,
-    input: hookInput,
-    env: {
-      HOME: workspace,
-      PATH: envPath,
-      NODE_NO_WARNINGS: "1",
-      CLAUDE_PLUGIN_ROOT: path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../plugins/gemini"),
-      CLAUDE_PLUGIN_DATA: pluginDataDir
-    },
+    cwd: ws.repo,
+    input: JSON.stringify({ cwd: ws.repo, ...input }),
+    env: { ...ws.env, ...(scenario ? { AGY_TEST_SCENARIO: scenario } : {}) },
     encoding: "utf8",
-    timeout: 5000
+    timeout: 30000
   });
-
-  return {
-    stdout: result.stdout.trim(),
-    stderr: result.stderr.trim(),
-    status: result.status
-  };
+  return { stdout: result.stdout.trim(), stderr: result.stderr.trim(), status: result.status };
 }
 
-test("review gate disabled: hook passes through silently", () => {
-  const workspace = makeTempDir("gate-off-");
-  const { stdout, status } = runHook(workspace, { gateEnabled: false });
+function enableGate(ws) {
+  const setup = runCompanion(["setup", "--enable-review-gate", "--json"], { cwd: ws.repo, env: ws.env });
+  assert.equal(JSON.parse(setup.stdout).reviewGateEnabled, true);
+}
+
+test("gate disabled: the hook passes silently without calling agy", () => {
+  const ws = makeFakeAgyWorkspace();
+  const { stdout, status } = runHook(ws, { scenario: "gate-block" });
   assert.equal(status, 0);
   assert.equal(stdout, "");
+  assert.equal(readArgvLog(ws.argvLog).length, 0);
 });
 
-test("review gate enabled + gemini unavailable: hook blocks with setup message", () => {
-  const workspace = makeTempDir("gate-no-gemini-");
-  const { stdout, status } = runHook(workspace, { gateEnabled: true, geminiAvailable: false });
-  assert.equal(status, 0);
-  const decision = JSON.parse(stdout);
+test("gate enabled without agy: the hook blocks with the setup step", () => {
+  const ws = makeFakeAgyWorkspace({ withAgy: false });
+  enableGate(ws);
+  const decision = JSON.parse(runHook(ws).stdout);
   assert.equal(decision.decision, "block");
-  assert.match(decision.reason, /not set up|not found/i);
+  assert.match(decision.reason, /agy is not installed/);
+  assert.match(decision.reason, /--disable-review-gate/);
+});
+
+test("ALLOW lets Claude stop, and the gate run is read-only and never resumable", () => {
+  const ws = makeFakeAgyWorkspace();
+  enableGate(ws);
+  const { stdout, status } = runHook(ws, { scenario: "gate-allow", input: { last_assistant_message: "Edited parser.js" } });
+  assert.equal(status, 0);
+  assert.equal(stdout, "");
+  const [args] = readArgvLog(ws.argvLog);
+  assert.ok(args.includes("plan"));
+  const reply = runCompanion(["reply", "continue"], { cwd: ws.repo, env: ws.env });
+  assert.equal(reply.status, 1);
+  assert.match(reply.stderr, /No previous Gemini conversation/);
+});
+
+test("the gate prompt carries Claude's last message", () => {
+  const ws = makeFakeAgyWorkspace();
+  enableGate(ws);
+  runHook(ws, { scenario: "echo", input: { last_assistant_message: "UNIQUE_LAST_MESSAGE_MARKER" } });
+  const status = runCompanion(["result", "--json"], { cwd: ws.repo, env: ws.env });
+  const stored = JSON.parse(status.stdout).storedJob;
+  assert.equal(stored.stopGate, true);
+  assert.match(JSON.parse(stored.result.rawOutput).input, /UNIQUE_LAST_MESSAGE_MARKER/);
+});
+
+test("BLOCK stops Claude with Gemini's reason", () => {
+  const ws = makeFakeAgyWorkspace();
+  enableGate(ws);
+  const decision = JSON.parse(runHook(ws, { scenario: "gate-block" }).stdout);
+  assert.equal(decision.decision, "block");
+  assert.match(decision.reason, /drops the last line/);
+});
+
+test("a failed gate run blocks with the failure detail", () => {
+  const ws = makeFakeAgyWorkspace();
+  enableGate(ws);
+  const decision = JSON.parse(runHook(ws, { scenario: "failed-result" }).stdout);
+  assert.equal(decision.decision, "block");
+  assert.match(decision.reason, /status ERROR/);
+});
+
+test("stop_hook_active skips the review so a persistent BLOCK cannot loop", () => {
+  const ws = makeFakeAgyWorkspace();
+  enableGate(ws);
+  const { stdout, status } = runHook(ws, { scenario: "gate-block", input: { stop_hook_active: true } });
+  assert.equal(status, 0);
+  assert.equal(stdout, "");
+  assert.equal(readArgvLog(ws.argvLog).length, 0);
 });

@@ -5,10 +5,10 @@ Copyright 2026 Momin Abrar Ghalib
 This plugin is derived from the Codex Plugin for Claude Code,
 Copyright 2026 OpenAI, licensed under the Apache License, Version 2.0.
 
-Portions of the Node.js plumbing (broker lifecycle, state management,
-job control, tracked jobs, arg parsing, fs helpers, and rendering) are
-forked from that codebase with identifiers renamed for the Gemini CLI
-(Google) integration.
+Portions of the Node.js plumbing (state management, job control, tracked
+jobs, arg parsing, fs helpers, and rendering) are forked from that codebase
+with identifiers renamed for the Gemini integration. Since 2.0.0 the plugin
+calls Gemini through the Antigravity CLI (agy).
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.

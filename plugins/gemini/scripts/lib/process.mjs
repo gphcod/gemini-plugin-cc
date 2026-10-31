@@ -1,6 +1,35 @@
 import { spawnSync } from "node:child_process";
 import process from "node:process";
 
+export function isPidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return false;
+  }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
+// agy runs as a process-group leader on POSIX, so its group outlives the
+// leader while any descendant is still running.
+export function isProcessGroupAlive(pid, platform = process.platform) {
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return false;
+  }
+  if (platform === "win32") {
+    return isPidAlive(pid);
+  }
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM" || isPidAlive(pid);
+  }
+}
+
 export function runCommand(command, args = [], options = {}) {
   const result = spawnSync(command, args, {
     cwd: options.cwd,
@@ -8,6 +37,7 @@ export function runCommand(command, args = [], options = {}) {
     encoding: "utf8",
     input: options.input,
     maxBuffer: options.maxBuffer,
+    timeout: options.timeout,
     stdio: options.stdio ?? "pipe",
     shell: process.platform === "win32" ? (process.env.SHELL || true) : false,
     windowsHide: true
@@ -100,21 +130,56 @@ export function terminateProcessTree(pid, options = {}) {
   try {
     killImpl(-pid, "SIGTERM");
     return { attempted: true, delivered: true, method: "process-group" };
-  } catch (error) {
-    if (error?.code !== "ESRCH") {
+  } catch {
+    // The pid may not lead a process group (a companion run inside another
+    // tool's shell), so a failed group signal always falls back to the pid.
+    try {
+      killImpl(pid, "SIGTERM");
+      return { attempted: true, delivered: true, method: "process" };
+    } catch (innerError) {
+      if (innerError?.code === "ESRCH") {
+        return { attempted: true, delivered: false, method: "process" };
+      }
+      throw innerError;
+    }
+  }
+}
+
+// Stops a process group with bounded escalation: SIGTERM, then SIGKILL for
+// whatever is left after `graceMs`. The caller does the escalation itself
+// because the process that would normally do it (the companion) may be dead.
+export async function stopProcessGroup(pid, options = {}) {
+  const platform = options.platform ?? process.platform;
+  const graceMs = options.graceMs ?? 1500;
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return { attempted: false, delivered: false, escalated: false };
+  }
+  if (platform === "win32") {
+    return { ...terminateProcessTree(pid, { platform }), escalated: false };
+  }
+  const signal = (name) => {
+    try {
+      process.kill(-pid, name);
+      return true;
+    } catch {
       try {
-        killImpl(pid, "SIGTERM");
-        return { attempted: true, delivered: true, method: "process" };
-      } catch (innerError) {
-        if (innerError?.code === "ESRCH") {
-          return { attempted: true, delivered: false, method: "process" };
-        }
-        throw innerError;
+        process.kill(pid, name);
+        return true;
+      } catch {
+        return false;
       }
     }
-
-    return { attempted: true, delivered: false, method: "process-group" };
+  };
+  const delivered = signal("SIGTERM");
+  const deadline = Date.now() + graceMs;
+  while (isProcessGroupAlive(pid, platform) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
   }
+  let escalated = false;
+  if (isProcessGroupAlive(pid, platform)) {
+    escalated = signal("SIGKILL");
+  }
+  return { attempted: true, delivered, escalated };
 }
 
 export function formatCommandFailure(result) {

@@ -1,8 +1,8 @@
 # Gemini Prompt Recipes
 
-Use these as starting templates for Gemini task prompts or other Gemini 3 prompt construction.
+Use these as starting templates for `task` prompts sent to Gemini through agy.
 Copy the smallest recipe that fits the task, then trim anything you do not need.
-In `gemini:gemini-rescue`, run diagnosis and fix-oriented recipes in write mode by default unless the user explicitly asked for read-only behavior.
+Diagnosis and research recipes usually want `--plan` (read-only); fix recipes run write-capable in agy's sandbox.
 
 For non-code delegation (writing, brainstorming, explanation, analysis) prefer the later recipes.
 Skip `<grounding_rules>` and `<citation_rules>` for creative or generative tasks where those blocks would overconstrain the output.

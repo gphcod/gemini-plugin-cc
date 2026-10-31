@@ -1,25 +1,7 @@
 import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
-
-export function ensureAbsolutePath(cwd, maybePath) {
-  return path.isAbsolute(maybePath) ? maybePath : path.resolve(cwd, maybePath);
-}
-
-export function createTempDir(prefix = "gemini-plugin-") {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-}
 
 export function readJsonFile(filePath) {
   return JSON.parse(fs.readFileSync(filePath, "utf8"));
-}
-
-export function writeJsonFile(filePath, value) {
-  fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
-}
-
-export function safeReadFile(filePath) {
-  return fs.existsSync(filePath) ? fs.readFileSync(filePath, "utf8") : "";
 }
 
 export function isProbablyText(buffer) {
@@ -32,9 +14,52 @@ export function isProbablyText(buffer) {
   return true;
 }
 
-export function readStdinIfPiped() {
-  if (process.stdin.isTTY) {
-    return "";
+export const STDIN_INACTIVITY_MS = 10_000;
+
+export class StdinTimeoutError extends Error {}
+
+// Claude Code's Bash tool can leave stdin open when a command holds a heredoc,
+// so a read that sees no byte (or no end of input) within the inactivity
+// window fails instead of hanging the turn.
+export function readStdinIfPiped({ inactivityMs = STDIN_INACTIVITY_MS, stdin = process.stdin } = {}) {
+  if (stdin.isTTY) {
+    return Promise.resolve("");
   }
-  return fs.readFileSync(0, "utf8");
+
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let timer;
+    const cleanup = () => {
+      clearTimeout(timer);
+      stdin.off("data", onData);
+      stdin.off("end", onEnd);
+      stdin.off("error", onError);
+    };
+    const arm = () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        cleanup();
+        stdin.destroy();
+        reject(new StdinTimeoutError(
+          `No end of input on stdin within ${Math.round(inactivityMs / 1000)} seconds. Pass the prompt as an argument or close stdin.`
+        ));
+      }, inactivityMs);
+    };
+    function onData(chunk) {
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      arm();
+    }
+    function onEnd() {
+      cleanup();
+      resolve(Buffer.concat(chunks).toString("utf8"));
+    }
+    function onError(error) {
+      cleanup();
+      reject(error);
+    }
+    stdin.on("data", onData);
+    stdin.once("end", onEnd);
+    stdin.once("error", onError);
+    arm();
+  });
 }

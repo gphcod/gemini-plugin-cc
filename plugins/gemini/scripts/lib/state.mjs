@@ -1,29 +1,35 @@
-import { createHash } from "node:crypto";
+// Per-workspace job store. No file here is read-modify-written by more than
+// one process, so no cross-process lock is needed:
+//
+//   jobs/<id>.json         job record; written only by the companion running it
+//   jobs/<id>.result.json  final payload; written once by that companion
+//   jobs/<id>.cancel       cancel marker; created exclusively by /gemini:cancel
+//   jobs/<id>.txt|.log     full answer text and progress log
+//   requests/<hash>.json   --request-id claim; created exclusively, first wins
+//   config.json            settings; written by /gemini:setup
+//
+// A job's status is derived when it is read: a cancel marker wins over the
+// record, and a record whose processes are all gone reads as failed.
+
+import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { isPidAlive, isProcessGroupAlive } from "./process.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
-const STATE_VERSION = 1;
 const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
 const FALLBACK_STATE_ROOT_DIR = path.join(os.tmpdir(), "gemini-companion");
-const STATE_FILE_NAME = "state.json";
-const JOBS_DIR_NAME = "jobs";
-const MAX_JOBS = 50;
+const MAX_FINISHED_JOBS = 50;
+// A live companion refreshes heartbeatAt every 5 s.
+const STALL_QUIET_MS = 30_000;
+const DEBRIS_QUIET_MS = 60_000;
+
+export { isPidAlive };
 
 function nowIso() {
   return new Date().toISOString();
-}
-
-function defaultState() {
-  return {
-    version: STATE_VERSION,
-    config: {
-      stopReviewGate: false
-    },
-    jobs: []
-  };
 }
 
 export function resolveStateDir(cwd) {
@@ -43,148 +49,112 @@ export function resolveStateDir(cwd) {
   return path.join(stateRoot, `${slug}-${hash}`);
 }
 
-export function resolveStateFile(cwd) {
-  return path.join(resolveStateDir(cwd), STATE_FILE_NAME);
+export function resolveJobsDir(cwd) {
+  return path.join(resolveStateDir(cwd), "jobs");
 }
 
-export function resolveJobsDir(cwd) {
-  return path.join(resolveStateDir(cwd), JOBS_DIR_NAME);
+function resolveRequestsDir(cwd) {
+  return path.join(resolveStateDir(cwd), "requests");
 }
 
 export function ensureStateDir(cwd) {
   const stateDir = resolveStateDir(cwd);
-  const jobsDir = resolveJobsDir(cwd);
-  fs.mkdirSync(jobsDir, { recursive: true, mode: 0o700 });
+  for (const dir of [resolveJobsDir(cwd), resolveRequestsDir(cwd)]) {
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    try { fs.chmodSync(dir, 0o700); } catch {}
+  }
   try { fs.chmodSync(stateDir, 0o700); } catch {}
-  try { fs.chmodSync(jobsDir, 0o700); } catch {}
 }
 
-export function loadState(cwd) {
-  const stateFile = resolveStateFile(cwd);
-  if (!fs.existsSync(stateFile)) {
-    return defaultState();
-  }
-
+// Readers never see a torn file: content goes to a temp file, then rename.
+function writeFileAtomic(filePath, data) {
+  const tempPath = `${filePath}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
+  fs.writeFileSync(tempPath, data, { encoding: "utf8", mode: 0o600 });
   try {
-    const parsed = JSON.parse(fs.readFileSync(stateFile, "utf8"));
-    return {
-      ...defaultState(),
-      ...parsed,
-      config: {
-        ...defaultState().config,
-        ...(parsed.config ?? {})
-      },
-      jobs: Array.isArray(parsed.jobs) ? parsed.jobs : []
-    };
+    fs.renameSync(tempPath, filePath);
+  } catch (error) {
+    try { fs.unlinkSync(tempPath); } catch {}
+    throw error;
+  }
+  try { fs.chmodSync(filePath, 0o600); } catch {}
+}
+
+// Publishes a fully written file under `filePath` only if that name is free.
+// Returns false when another process created it first.
+function createFileExclusive(filePath, data) {
+  const tempPath = `${filePath}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
+  fs.writeFileSync(tempPath, data, { encoding: "utf8", mode: 0o600 });
+  try {
+    fs.linkSync(tempPath, filePath);
+    return true;
+  } catch (error) {
+    if (error.code === "EEXIST") return false;
+    throw error;
+  } finally {
+    try { fs.unlinkSync(tempPath); } catch {}
+  }
+}
+
+function readJsonOrNull(filePath) {
+  try {
+    return JSON.parse(fs.readFileSync(filePath, "utf8"));
   } catch {
-    return defaultState();
+    return null;
   }
 }
 
-function pruneJobs(jobs) {
-  return [...jobs]
-    .sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")))
-    .slice(0, MAX_JOBS);
+function removeFile(filePath) {
+  try { fs.unlinkSync(filePath); } catch {}
 }
 
-function removeFileIfExists(filePath) {
-  if (filePath && fs.existsSync(filePath)) {
-    fs.unlinkSync(filePath);
-  }
+// --- config ---------------------------------------------------------------
+
+const DEFAULT_CONFIG = { stopReviewGate: false };
+
+export function getConfig(cwd) {
+  const stateDir = resolveStateDir(cwd);
+  const config = readJsonOrNull(path.join(stateDir, "config.json"))
+    ?? readJsonOrNull(path.join(stateDir, "state.json"))?.config
+    ?? {};
+  return { ...DEFAULT_CONFIG, ...config };
 }
 
-export function saveState(cwd, state) {
-  const previousJobs = loadState(cwd).jobs;
+export function setConfig(cwd, key, value) {
   ensureStateDir(cwd);
-  const nextJobs = pruneJobs(state.jobs ?? []);
-  const nextState = {
-    version: STATE_VERSION,
-    config: {
-      ...defaultState().config,
-      ...(state.config ?? {})
-    },
-    jobs: nextJobs
-  };
-
-  const retainedIds = new Set(nextJobs.map((job) => job.id));
-  for (const job of previousJobs) {
-    if (retainedIds.has(job.id)) {
-      continue;
-    }
-    removeJobFile(resolveJobFile(cwd, job.id));
-    removeFileIfExists(job.logFile);
-  }
-
-  const stateFile = resolveStateFile(cwd);
-  fs.writeFileSync(stateFile, `${JSON.stringify(nextState, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-  try { fs.chmodSync(stateFile, 0o600); } catch {}
-  return nextState;
+  const next = { ...getConfig(cwd), [key]: value };
+  writeFileAtomic(path.join(resolveStateDir(cwd), "config.json"), `${JSON.stringify(next, null, 2)}\n`);
+  return next;
 }
 
-export function updateState(cwd, mutate) {
-  const state = loadState(cwd);
-  mutate(state);
-  return saveState(cwd, state);
-}
+// --- job records ------------------------------------------------------------
 
 export function generateJobId(prefix = "job") {
   const random = Math.random().toString(36).slice(2, 8);
   return `${prefix}-${Date.now().toString(36)}-${random}`;
 }
 
-export function upsertJob(cwd, jobPatch) {
-  return updateState(cwd, (state) => {
-    const timestamp = nowIso();
-    const existingIndex = state.jobs.findIndex((job) => job.id === jobPatch.id);
-    if (existingIndex === -1) {
-      state.jobs.unshift({
-        createdAt: timestamp,
-        updatedAt: timestamp,
-        ...jobPatch
-      });
-      return;
+// Short handle shown to users and the model: 4 base36 characters.
+export function generateJobHandle(existingJobs = []) {
+  const taken = new Set(existingJobs.map((job) => job.handle).filter(Boolean));
+  for (let attempt = 0; attempt < 32; attempt += 1) {
+    const handle = randomBytes(4).readUInt32BE(0).toString(36).padStart(4, "0").slice(-4);
+    if (!taken.has(handle)) {
+      return handle;
     }
-    state.jobs[existingIndex] = {
-      ...state.jobs[existingIndex],
-      ...jobPatch,
-      updatedAt: timestamp
-    };
-  });
-}
-
-export function listJobs(cwd) {
-  return loadState(cwd).jobs;
-}
-
-export function setConfig(cwd, key, value) {
-  return updateState(cwd, (state) => {
-    state.config = {
-      ...state.config,
-      [key]: value
-    };
-  });
-}
-
-export function getConfig(cwd) {
-  return loadState(cwd).config;
-}
-
-export function writeJobFile(cwd, jobId, payload) {
-  ensureStateDir(cwd);
-  const jobFile = resolveJobFile(cwd, jobId);
-  fs.writeFileSync(jobFile, `${JSON.stringify(payload, null, 2)}\n`, { encoding: "utf8", mode: 0o600 });
-  try { fs.chmodSync(jobFile, 0o600); } catch {}
-  return jobFile;
-}
-
-export function readJobFile(jobFile) {
-  return JSON.parse(fs.readFileSync(jobFile, "utf8"));
-}
-
-function removeJobFile(jobFile) {
-  if (fs.existsSync(jobFile)) {
-    fs.unlinkSync(jobFile);
   }
+  return randomBytes(6).toString("hex").slice(0, 6);
+}
+
+export function resolveJobFile(cwd, jobId) {
+  return path.join(resolveJobsDir(cwd), `${jobId}.json`);
+}
+
+function resolveJobResultFile(cwd, jobId) {
+  return path.join(resolveJobsDir(cwd), `${jobId}.result.json`);
+}
+
+function resolveCancelMarker(cwd, jobId) {
+  return path.join(resolveJobsDir(cwd), `${jobId}.cancel`);
 }
 
 export function resolveJobLogFile(cwd, jobId) {
@@ -192,7 +162,155 @@ export function resolveJobLogFile(cwd, jobId) {
   return path.join(resolveJobsDir(cwd), `${jobId}.log`);
 }
 
-export function resolveJobFile(cwd, jobId) {
+export function resolveAnswerFile(cwd, jobId) {
   ensureStateDir(cwd);
-  return path.join(resolveJobsDir(cwd), `${jobId}.json`);
+  return path.join(resolveJobsDir(cwd), `${jobId}.txt`);
+}
+
+export function writeAnswerFile(cwd, jobId, text) {
+  const answerFile = resolveAnswerFile(cwd, jobId);
+  writeFileAtomic(answerFile, String(text ?? ""));
+  return answerFile;
+}
+
+// Owner only: the companion running the job is the record's sole writer.
+export function writeJobRecord(cwd, record) {
+  ensureStateDir(cwd);
+  const timestamp = nowIso();
+  const next = { createdAt: timestamp, ...record, updatedAt: timestamp };
+  writeFileAtomic(resolveJobFile(cwd, record.id), `${JSON.stringify(next, null, 2)}\n`);
+  return next;
+}
+
+// Owner only.
+export function patchJobRecord(cwd, jobId, patch) {
+  const current = readJsonOrNull(resolveJobFile(cwd, jobId));
+  if (!current) {
+    return null;
+  }
+  return writeJobRecord(cwd, { ...current, ...patch, id: jobId });
+}
+
+// Owner only, once, when the run ends.
+export function writeJobResult(cwd, jobId, payload) {
+  ensureStateDir(cwd);
+  writeFileAtomic(resolveJobResultFile(cwd, jobId), `${JSON.stringify(payload, null, 2)}\n`);
+}
+
+export function readJobResult(cwd, jobId) {
+  return readJsonOrNull(resolveJobResultFile(cwd, jobId));
+}
+
+export function removeJobRecord(cwd, jobId) {
+  removeFile(resolveJobFile(cwd, jobId));
+}
+
+// Any process. Returns true when this call created the marker.
+export function markJobCancelled(cwd, jobId) {
+  ensureStateDir(cwd);
+  return createFileExclusive(resolveCancelMarker(cwd, jobId), `${JSON.stringify({ cancelledAt: nowIso(), by: process.pid })}\n`);
+}
+
+export function readCancelMarker(cwd, jobId) {
+  return readJsonOrNull(resolveCancelMarker(cwd, jobId));
+}
+
+function isActiveStatus(status) {
+  return status === "queued" || status === "running";
+}
+
+function lastSignOfLife(record) {
+  return Date.parse(record.heartbeatAt ?? record.startedAt ?? record.updatedAt ?? record.createdAt ?? "");
+}
+
+// An active record is stalled when its companion is gone (or silent long
+// enough to rule out PID reuse). A stalled record whose agy process group is
+// also gone and that stayed quiet past DEBRIS_QUIET_MS can never finish, so it
+// reads as failed. A live agy group keeps it active: /gemini:cancel needs its
+// handle and agyPid to stop that process tree.
+export function deriveJobState(record, cancel, now = Date.now()) {
+  if (cancel) {
+    return {
+      ...record,
+      status: "cancelled",
+      phase: "cancelled",
+      completedAt: record.completedAt && !isActiveStatus(record.status) ? record.completedAt : cancel.cancelledAt,
+      errorMessage: record.errorMessage ?? "Cancelled by user.",
+      stalled: false
+    };
+  }
+  if (!isActiveStatus(record.status)) {
+    return { ...record, stalled: false };
+  }
+  const quietFor = now - lastSignOfLife(record);
+  const companionGone =
+    (record.pid != null && !isPidAlive(record.pid)) || (Number.isFinite(quietFor) && quietFor > STALL_QUIET_MS * 4);
+  const stalled = companionGone && (!Number.isFinite(quietFor) || quietFor > STALL_QUIET_MS);
+  if (!stalled) {
+    return { ...record, stalled: false };
+  }
+  const agyAlive = record.agyPid != null && isProcessGroupAlive(record.agyPid);
+  if (!agyAlive && Number.isFinite(quietFor) && quietFor > DEBRIS_QUIET_MS) {
+    return {
+      ...record,
+      status: "failed",
+      phase: "failed",
+      stalled: false,
+      errorMessage: record.errorMessage ?? "The companion process ended without recording a result."
+    };
+  }
+  return { ...record, stalled: true };
+}
+
+export function listJobs(cwd) {
+  const jobsDir = resolveJobsDir(cwd);
+  let names;
+  try {
+    names = fs.readdirSync(jobsDir);
+  } catch {
+    return [];
+  }
+  const now = Date.now();
+  const jobs = [];
+  for (const name of names) {
+    if (!name.endsWith(".json") || name.endsWith(".result.json")) continue;
+    const record = readJsonOrNull(path.join(jobsDir, name));
+    if (!record?.id) continue;
+    jobs.push(deriveJobState(record, readCancelMarker(cwd, record.id), now));
+  }
+  return jobs.sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")));
+}
+
+// --- request ids ------------------------------------------------------------
+
+function resolveRequestClaim(cwd, requestId) {
+  const digest = createHash("sha256").update(String(requestId)).digest("hex").slice(0, 32);
+  return path.join(resolveRequestsDir(cwd), `${digest}.json`);
+}
+
+// First caller wins. Returns { claimed: true } or the winning job's id.
+export function claimRequestId(cwd, requestId, jobId) {
+  ensureStateDir(cwd);
+  const claimFile = resolveRequestClaim(cwd, requestId);
+  if (createFileExclusive(claimFile, `${JSON.stringify({ requestId, jobId })}\n`)) {
+    return { claimed: true, jobId };
+  }
+  const existing = readJsonOrNull(claimFile);
+  return { claimed: false, jobId: existing?.jobId ?? null };
+}
+
+// --- pruning ----------------------------------------------------------------
+
+// Keeps the newest finished jobs. Active and stalled jobs are never removed,
+// whatever their age, so a running process tree always stays cancellable.
+// Request claims are never removed: a claim cannot be retired safely while
+// another caller may be re-creating it, and each is under 100 bytes. A retry
+// whose job was pruned is told to use a new id.
+export function pruneFinishedJobs(cwd, maxFinished = MAX_FINISHED_JOBS) {
+  const finished = listJobs(cwd).filter((job) => !isActiveStatus(job.status));
+  for (const job of finished.slice(maxFinished)) {
+    for (const suffix of [".json", ".result.json", ".cancel", ".txt", ".log"]) {
+      removeFile(path.join(resolveJobsDir(cwd), `${job.id}${suffix}`));
+    }
+  }
 }

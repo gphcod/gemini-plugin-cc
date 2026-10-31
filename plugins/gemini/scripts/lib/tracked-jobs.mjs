@@ -1,9 +1,14 @@
 import fs from "node:fs";
 import process from "node:process";
 
-import { readJobFile, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile } from "./state.mjs";
-
-export const SESSION_ID_ENV = "GEMINI_COMPANION_SESSION_ID";
+import {
+  patchJobRecord,
+  pruneFinishedJobs,
+  readCancelMarker,
+  resolveJobLogFile,
+  writeJobRecord,
+  writeJobResult
+} from "./state.mjs";
 
 export function nowIso() {
   return new Date().toISOString();
@@ -14,9 +19,8 @@ function normalizeProgressEvent(value) {
     return {
       message: String(value.message ?? "").trim(),
       phase: typeof value.phase === "string" && value.phase.trim() ? value.phase.trim() : null,
-      threadId: typeof value.threadId === "string" && value.threadId.trim() ? value.threadId.trim() : null,
-      turnId: typeof value.turnId === "string" && value.turnId.trim() ? value.turnId.trim() : null,
-      stderrMessage: value.stderrMessage == null ? null : String(value.stderrMessage).trim(),
+      conversationId:
+        typeof value.conversationId === "string" && value.conversationId.trim() ? value.conversationId.trim() : null,
       logTitle: typeof value.logTitle === "string" && value.logTitle.trim() ? value.logTitle.trim() : null,
       logBody: value.logBody == null ? null : String(value.logBody).trimEnd()
     };
@@ -25,9 +29,7 @@ function normalizeProgressEvent(value) {
   return {
     message: String(value ?? "").trim(),
     phase: null,
-    threadId: null,
-    turnId: null,
-    stderrMessage: String(value ?? "").trim(),
+    conversationId: null,
     logTitle: null,
     logBody: null
   };
@@ -58,20 +60,16 @@ export function createJobLogFile(workspaceRoot, jobId, title) {
   return logFile;
 }
 
-export function createJobRecord(base, options = {}) {
-  const env = options.env ?? process.env;
-  const sessionId = env[options.sessionIdEnv ?? SESSION_ID_ENV];
+export function createJobRecord(base) {
   return {
     ...base,
-    createdAt: nowIso(),
-    ...(sessionId ? { sessionId } : {})
+    createdAt: nowIso()
   };
 }
 
 export function createJobProgressUpdater(workspaceRoot, jobId) {
   let lastPhase = null;
-  let lastThreadId = null;
-  let lastTurnId = null;
+  let lastConversationId = null;
 
   return (event) => {
     const normalized = normalizeProgressEvent(event);
@@ -84,15 +82,9 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
       changed = true;
     }
 
-    if (normalized.threadId && normalized.threadId !== lastThreadId) {
-      lastThreadId = normalized.threadId;
-      patch.threadId = normalized.threadId;
-      changed = true;
-    }
-
-    if (normalized.turnId && normalized.turnId !== lastTurnId) {
-      lastTurnId = normalized.turnId;
-      patch.turnId = normalized.turnId;
+    if (normalized.conversationId && normalized.conversationId !== lastConversationId) {
+      lastConversationId = normalized.conversationId;
+      patch.conversationId = normalized.conversationId;
       changed = true;
     }
 
@@ -100,106 +92,105 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
       return;
     }
 
-    upsertJob(workspaceRoot, patch);
-
-    const jobFile = resolveJobFile(workspaceRoot, jobId);
-    if (!fs.existsSync(jobFile)) {
-      return;
-    }
-
-    const storedJob = readJobFile(jobFile);
-    writeJobFile(workspaceRoot, jobId, {
-      ...storedJob,
-      ...patch
-    });
+    patchJobRecord(workspaceRoot, jobId, patch);
   };
 }
 
-export function createProgressReporter({ stderr = false, logFile = null, onEvent = null } = {}) {
-  if (!stderr && !logFile && !onEvent) {
+export function createProgressReporter({ logFile = null, onEvent = null } = {}) {
+  if (!logFile && !onEvent) {
     return null;
   }
 
   return (eventOrMessage) => {
     const event = normalizeProgressEvent(eventOrMessage);
-    const stderrMessage = event.stderrMessage ?? event.message;
-    if (stderr && stderrMessage) {
-      process.stderr.write(`[gemini] ${stderrMessage}\n`);
-    }
     appendLogLine(logFile, event.message);
     appendLogBlock(logFile, event.logTitle, event.logBody);
     onEvent?.(event);
   };
 }
 
-function readStoredJobOrNull(workspaceRoot, jobId) {
-  const jobFile = resolveJobFile(workspaceRoot, jobId);
-  if (!fs.existsSync(jobFile)) {
-    return null;
-  }
-  return readJobFile(jobFile);
+// The owner consumes /gemini:cancel itself: cancel may not be able to signal
+// this process (its heartbeat can look stale while the event loop is busy,
+// say during a large diff collection), so the marker is polled and also
+// checked right before agy is launched. Returns a stop function.
+export function watchForCancel(workspaceRoot, jobId, onCancel, intervalMs = 1000) {
+  let fired = false;
+  const check = () => {
+    if (fired) return true;
+    if (readCancelMarker(workspaceRoot, jobId)) {
+      fired = true;
+      onCancel();
+    }
+    return fired;
+  };
+  const timer = setInterval(check, intervalMs);
+  timer.unref?.();
+  return { check, stop: () => clearInterval(timer) };
 }
 
+// A running companion refreshes heartbeatAt so status can tell a working job
+// from debris left by a killed process. Returns a stop function.
+export function startJobHeartbeat(workspaceRoot, jobId, intervalMs = 5000) {
+  const beat = () => {
+    try {
+      patchJobRecord(workspaceRoot, jobId, { heartbeatAt: nowIso() });
+    } catch {
+      // A failed heartbeat must not kill the job itself.
+    }
+  };
+  beat();
+  const timer = setInterval(beat, intervalMs);
+  timer.unref?.();
+  return () => clearInterval(timer);
+}
+
+// The companion is the only writer of its job record. /gemini:cancel never
+// rewrites the record; it creates a cancel marker, which wins when the job is
+// read, so a run that unwinds after a cancel cannot hide the cancellation.
 export async function runTrackedJob(job, runner, options = {}) {
-  const runningRecord = {
+  const logFile = options.logFile ?? job.logFile ?? null;
+  writeJobRecord(job.workspaceRoot, {
     ...job,
     status: "running",
     startedAt: nowIso(),
+    heartbeatAt: nowIso(),
     phase: "starting",
     pid: process.pid,
-    logFile: options.logFile ?? job.logFile ?? null
-  };
-  writeJobFile(job.workspaceRoot, job.id, runningRecord);
-  upsertJob(job.workspaceRoot, runningRecord);
+    logFile
+  });
 
+  let execution;
   try {
-    const execution = await runner();
-    const completionStatus = execution.exitStatus === 0 ? "completed" : "failed";
-    const completedAt = nowIso();
-    writeJobFile(job.workspaceRoot, job.id, {
-      ...runningRecord,
-      status: completionStatus,
-      threadId: execution.threadId ?? null,
-      turnId: execution.turnId ?? null,
-      pid: null,
-      phase: completionStatus === "completed" ? "done" : "failed",
-      completedAt,
-      result: execution.payload,
-      rendered: execution.rendered
-    });
-    upsertJob(job.workspaceRoot, {
-      id: job.id,
-      status: completionStatus,
-      threadId: execution.threadId ?? null,
-      turnId: execution.turnId ?? null,
-      summary: execution.summary,
-      phase: completionStatus === "completed" ? "done" : "failed",
-      pid: null,
-      completedAt
-    });
-    appendLogBlock(options.logFile ?? job.logFile ?? null, "Final output", execution.rendered);
-    return execution;
+    execution = await runner();
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
-    const existing = readStoredJobOrNull(job.workspaceRoot, job.id) ?? runningRecord;
-    const completedAt = nowIso();
-    writeJobFile(job.workspaceRoot, job.id, {
-      ...existing,
-      status: "failed",
-      phase: "failed",
-      errorMessage,
-      pid: null,
-      completedAt,
-      logFile: options.logFile ?? job.logFile ?? existing.logFile ?? null
-    });
-    upsertJob(job.workspaceRoot, {
-      id: job.id,
-      status: "failed",
-      phase: "failed",
-      pid: null,
-      errorMessage,
-      completedAt
-    });
+    patchJobRecord(job.workspaceRoot, job.id, { status: "failed", phase: "failed", errorMessage, pid: null, completedAt: nowIso() });
+    pruneFinishedJobs(job.workspaceRoot);
     throw error;
   }
+
+  const completionStatus = execution.jobStatus ?? (execution.exitStatus === 0 ? "completed" : "failed");
+  writeJobResult(job.workspaceRoot, job.id, {
+    exitStatus: execution.exitStatus ?? 0,
+    answerFile: execution.answerFile ?? null,
+    result: execution.payload,
+    rendered: execution.rendered
+  });
+  patchJobRecord(job.workspaceRoot, job.id, {
+    status: completionStatus,
+    phase: completionStatus === "completed" ? "done" : "failed",
+    conversationId: execution.conversationId ?? null,
+    exitStatus: execution.exitStatus ?? 0,
+    summary: execution.summary,
+    answerFile: execution.answerFile ?? null,
+    pid: null,
+    completedAt: nowIso()
+  });
+  appendLogBlock(logFile, "Final output", execution.rendered);
+  pruneFinishedJobs(job.workspaceRoot);
+
+  if (readCancelMarker(job.workspaceRoot, job.id)) {
+    return { ...execution, exitStatus: execution.exitStatus || 1, cancelled: true };
+  }
+  return execution;
 }

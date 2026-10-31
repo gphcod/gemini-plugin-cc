@@ -32,7 +32,7 @@ Actively try to disprove the change.
 Look for violated invariants, missing guards, unhandled failure paths, and assumptions that stop being true under stress.
 Trace how bad inputs, retries, concurrent actions, or partially completed operations move through the code.
 If the user supplied a focus area, weight it heavily, but still report any other material issue you can defend.
-If you need deeper context on how a file is used elsewhere, call Gemini CLI's built-in `codebase_investigator` subagent — it ships with the `codebase-investigation` skill and will return a focused map of call sites, invariants, and hidden dependencies before you finalize findings.
+This is a read-only review: you may read files and run read-only git commands to trace call sites and invariants, but never modify the workspace.
 {{REVIEW_COLLECTION_GUIDANCE}}
 </review_method>
 
@@ -47,16 +47,14 @@ A finding should answer:
 </finding_bar>
 
 <structured_output_contract>
-Return only valid JSON matching the provided schema.
+Your final answer must be one JSON object with exactly these keys:
+- `verdict`: `"approve"` (ship) or `"needs-attention"` (do not ship yet).
+- `summary`: a terse ship/no-ship assessment, not a neutral recap.
+- `findings`: an array, most severe first; each item has `severity` (`critical`, `high`, `medium`, or `low`), `title`, `body` (what goes wrong, why, and the impact), `file`, `line_start`, `line_end`, `confidence` (0 to 1), and `recommendation` (the concrete change).
+- `next_steps`: an array of short strings.
 Keep the output compact and specific.
 Use `needs-attention` if there is any material risk worth blocking on.
-Use `approve` only if you cannot support any substantive adversarial finding from the provided context.
-Every finding must include:
-- the affected file
-- `line_start` and `line_end`
-- a confidence score from 0 to 1
-- a concrete recommendation
-Write the summary like a terse ship/no-ship assessment, not a neutral recap.
+Use `approve` only if you cannot support any substantive adversarial finding from the provided context, and return an empty `findings` array.
 </structured_output_contract>
 
 <grounding_rules>

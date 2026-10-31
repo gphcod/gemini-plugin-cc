@@ -99,12 +99,12 @@ If a point is an inference, label it clearly.
 </grounding_rules>
 ```
 
-## Relying on a Codex-style built-in review mode
+## Hand-rolling a review through `task`
 
 Bad:
 
 ```text
-Ask Gemini to use its built-in review or "start review session" ACP method.
+task --plan "review my diff and tell me if it is ok"
 ```
 
-Gemini has no built-in review mode and no review-start ACP method. All reviews are prompt-based through `/gemini:review` or `/gemini:adversarial-review`, which use the prompt templates in `prompts/adversarial-review.md` and the stop-review-gate flow. Do not invent a review-mode ACP call — it does not exist.
+Use the `review` or `adversarial-review` subcommands instead. They collect the diff, send the review contract, and have agy enforce the findings schema with `--json-schema`; a free-form `task` review loses severity ordering, exact locations, and the ship/no-ship verdict.

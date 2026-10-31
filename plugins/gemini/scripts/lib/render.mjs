@@ -1,3 +1,5 @@
+const ANSWER_CAP_BYTES = 24 * 1024;
+
 function severityRank(severity) {
   switch (severity) {
     case "critical":
@@ -21,7 +23,7 @@ function formatLineRange(finding) {
   return `:${finding.line_start}-${finding.line_end}`;
 }
 
-function validateReviewResultShape(data) {
+export function validateReviewResultShape(data) {
   if (!data || typeof data !== "object" || Array.isArray(data)) {
     return "Expected a top-level JSON object.";
   }
@@ -59,135 +61,34 @@ function normalizeReviewFinding(finding, index) {
   };
 }
 
-function normalizeReviewResultData(data) {
-  return {
-    verdict: data.verdict.trim(),
-    summary: data.summary.trim(),
-    findings: data.findings.map((finding, index) => normalizeReviewFinding(finding, index)),
-    next_steps: data.next_steps
-      .filter((step) => typeof step === "string" && step.trim())
-      .map((step) => step.trim())
-  };
+// Caps the text shown on stdout; the full text always lives in the answer file.
+export function capAnswer(text) {
+  const normalized = String(text ?? "");
+  if (Buffer.byteLength(normalized, "utf8") <= ANSWER_CAP_BYTES) {
+    return { text: normalized, truncated: false };
+  }
+  const buffer = Buffer.from(normalized, "utf8").subarray(0, ANSWER_CAP_BYTES);
+  return { text: `${buffer.toString("utf8")}\n… (truncated; full text in the answer file)`, truncated: true };
 }
 
-function isStructuredReviewStoredResult(storedJob) {
-  const result = storedJob?.result;
-  if (!result || typeof result !== "object" || Array.isArray(result)) {
-    return false;
-  }
-  return (
-    Object.prototype.hasOwnProperty.call(result, "result") ||
-    Object.prototype.hasOwnProperty.call(result, "parseError")
-  );
-}
-
-function formatJobLine(job) {
-  const parts = [job.id, `${job.status || "unknown"}`];
-  if (job.kindLabel) {
-    parts.push(job.kindLabel);
-  }
-  if (job.title) {
-    parts.push(job.title);
-  }
-  return parts.join(" | ");
-}
-
-function escapeMarkdownCell(value) {
-  return String(value ?? "")
-    .replace(/\|/g, "\\|")
-    .replace(/\r?\n/g, " ")
-    .trim();
-}
-
-function formatGeminiResumeCommand(job) {
-  if (!job?.threadId) {
-    return null;
-  }
-  return `gemini --resume ${job.threadId}`;
-}
-
-function appendActiveJobsTable(lines, jobs) {
-  lines.push("Active jobs:");
-  lines.push("| Job | Kind | Status | Phase | Elapsed | Gemini Session ID | Summary | Actions |");
-  lines.push("| --- | --- | --- | --- | --- | --- | --- | --- |");
-  for (const job of jobs) {
-    const actions = [`/gemini:status ${job.id}`];
-    if (job.status === "queued" || job.status === "running") {
-      actions.push(`/gemini:cancel ${job.id}`);
-    }
-    lines.push(
-      `| ${escapeMarkdownCell(job.id)} | ${escapeMarkdownCell(job.kindLabel)} | ${escapeMarkdownCell(job.status)} | ${escapeMarkdownCell(job.phase ?? "")} | ${escapeMarkdownCell(job.elapsed ?? "")} | ${escapeMarkdownCell(job.threadId ?? "")} | ${escapeMarkdownCell(job.summary ?? "")} | ${actions.map((action) => `\`${action}\``).join("<br>")} |`
-    );
-  }
-}
-
-function pushJobDetails(lines, job, options = {}) {
-  lines.push(`- ${formatJobLine(job)}`);
-  if (job.summary) {
-    lines.push(`  Summary: ${job.summary}`);
-  }
-  if (job.phase) {
-    lines.push(`  Phase: ${job.phase}`);
-  }
-  if (options.showElapsed && job.elapsed) {
-    lines.push(`  Elapsed: ${job.elapsed}`);
-  }
-  if (options.showDuration && job.duration) {
-    lines.push(`  Duration: ${job.duration}`);
-  }
-  if (job.threadId) {
-    lines.push(`  Gemini session ID: ${job.threadId}`);
-  }
-  const resumeCommand = formatGeminiResumeCommand(job);
-  if (resumeCommand) {
-    lines.push(`  Resume in Gemini: ${resumeCommand}`);
-  }
-  if (job.logFile && options.showLog) {
-    lines.push(`  Log: ${job.logFile}`);
-  }
-  if ((job.status === "queued" || job.status === "running") && options.showCancelHint) {
-    lines.push(`  Cancel: /gemini:cancel ${job.id}`);
-  }
-  if (job.status !== "queued" && job.status !== "running" && options.showResultHint) {
-    lines.push(`  Result: /gemini:result ${job.id}`);
-  }
-  if (job.status !== "queued" && job.status !== "running" && job.jobClass === "task" && job.write && options.showReviewHint) {
-    lines.push("  Review changes: /gemini:review --wait");
-    lines.push("  Stricter review: /gemini:adversarial-review --wait");
-  }
-  if (job.progressPreview?.length) {
-    lines.push("  Progress:");
-    for (const line of job.progressPreview) {
-      lines.push(`    ${line}`);
-    }
-  }
-}
-
-function appendReasoningSection(lines, reasoningSummary) {
-  if (!Array.isArray(reasoningSummary) || reasoningSummary.length === 0) {
-    return;
-  }
-
-  lines.push("", "Reasoning:");
-  for (const section of reasoningSummary) {
-    lines.push(`- ${section}`);
-  }
+// One compact footer per call: status, handle, duration, and the answer file
+// only when stdout was truncated.
+export function renderFooter({ status = "ok", handle, duration, answerFile, hint }) {
+  const parts = [`gemini ${status}`];
+  if (handle) parts.push(`job ${handle}`);
+  if (duration) parts.push(duration);
+  if (answerFile) parts.push(`full: ${answerFile}`);
+  if (hint) parts.push(hint);
+  return parts.join(" · ");
 }
 
 export function renderSetupReport(report) {
   const lines = [
-    "# Gemini Setup",
-    "",
-    `Status: ${report.ready ? "ready" : "needs attention"}`,
-    "",
-    "Checks:",
+    `Gemini setup: ${report.ready ? "ready" : "needs attention"}`,
     `- node: ${report.node.detail}`,
-    `- npm: ${report.npm.detail}`,
-    `- gemini: ${report.gemini.detail}`,
-    `- auth: ${report.auth.detail}${report.auth.verified === true ? " (verified)" : report.auth.verified === false ? " (verification failed)" : " (unverified)"}`,
-    `- session runtime: ${report.sessionRuntime.label}`,
-    `- review gate: ${report.reviewGateEnabled ? "enabled" : "disabled"}`,
-    ""
+    `- agy: ${report.agy.available ? report.agy.detail : "not installed"}`,
+    `- auth: ${report.auth.detail}`,
+    `- review gate: ${report.reviewGateEnabled ? "enabled" : "disabled"}`
   ];
 
   if (report.actionsTaken.length > 0) {
@@ -195,7 +96,6 @@ export function renderSetupReport(report) {
     for (const action of report.actionsTaken) {
       lines.push(`- ${action}`);
     }
-    lines.push("");
   }
 
   if (report.nextSteps.length > 0) {
@@ -211,51 +111,38 @@ export function renderSetupReport(report) {
 export function renderReviewResult(parsedResult, meta) {
   if (!parsedResult.parsed) {
     const lines = [
-      `# Gemini ${meta.reviewLabel}`,
-      "",
-      "Gemini did not return valid structured JSON.",
-      "",
+      `${meta.reviewLabel} failed: Gemini did not return valid structured JSON.`,
       `- Parse error: ${parsedResult.parseError}`
     ];
-
     if (parsedResult.rawOutput) {
-      lines.push("", "Raw final message:", "", "```text", parsedResult.rawOutput, "```");
+      const { text } = capAnswer(parsedResult.rawOutput);
+      lines.push("", "Raw final message:", "", "```text", text, "```");
     }
-
-    appendReasoningSection(lines, meta.reasoningSummary ?? parsedResult.reasoningSummary);
-
     return `${lines.join("\n").trimEnd()}\n`;
   }
 
   const validationError = validateReviewResultShape(parsedResult.parsed);
   if (validationError) {
     const lines = [
-      `# Gemini ${meta.reviewLabel}`,
-      "",
-      `Target: ${meta.targetLabel}`,
-      "Gemini returned JSON with an unexpected review shape.",
-      "",
+      `${meta.reviewLabel} failed: Gemini returned JSON with an unexpected review shape.`,
       `- Validation error: ${validationError}`
     ];
-
     if (parsedResult.rawOutput) {
-      lines.push("", "Raw final message:", "", "```text", parsedResult.rawOutput, "```");
+      const { text } = capAnswer(parsedResult.rawOutput);
+      lines.push("", "Raw final message:", "", "```text", text, "```");
     }
-
-    appendReasoningSection(lines, meta.reasoningSummary ?? parsedResult.reasoningSummary);
-
     return `${lines.join("\n").trimEnd()}\n`;
   }
 
-  const data = normalizeReviewResultData(parsedResult.parsed);
-  const findings = [...data.findings].sort((left, right) => severityRank(left.severity) - severityRank(right.severity));
+  const data = parsedResult.parsed;
+  const findings = data.findings
+    .map((finding, index) => normalizeReviewFinding(finding, index))
+    .sort((left, right) => severityRank(left.severity) - severityRank(right.severity));
   const lines = [
-    `# Gemini ${meta.reviewLabel}`,
+    `${meta.reviewLabel} (${meta.targetLabel})`,
+    `Verdict: ${data.verdict.trim()}`,
     "",
-    `Target: ${meta.targetLabel}`,
-    `Verdict: ${data.verdict}`,
-    "",
-    data.summary,
+    data.summary.trim(),
     ""
   ];
 
@@ -264,8 +151,7 @@ export function renderReviewResult(parsedResult, meta) {
   } else {
     lines.push("Findings:");
     for (const finding of findings) {
-      const lineSuffix = formatLineRange(finding);
-      lines.push(`- [${finding.severity}] ${finding.title} (${finding.file}${lineSuffix})`);
+      lines.push(`- [${finding.severity}] ${finding.title} (${finding.file}${formatLineRange(finding)})`);
       lines.push(`  ${finding.body}`);
       if (finding.recommendation) {
         lines.push(`  Recommendation: ${finding.recommendation}`);
@@ -273,193 +159,105 @@ export function renderReviewResult(parsedResult, meta) {
     }
   }
 
-  if (data.next_steps.length > 0) {
+  const nextSteps = data.next_steps.filter((step) => typeof step === "string" && step.trim());
+  if (nextSteps.length > 0) {
     lines.push("", "Next steps:");
-    for (const step of data.next_steps) {
-      lines.push(`- ${step}`);
+    for (const step of nextSteps) {
+      lines.push(`- ${step.trim()}`);
     }
   }
 
-  appendReasoningSection(lines, meta.reasoningSummary);
-
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
-export function renderNativeReviewResult(result, meta) {
-  const stdout = result.stdout.trim();
-  const stderr = result.stderr.trim();
-  const lines = [
-    `# Gemini ${meta.reviewLabel}`,
-    "",
-    `Target: ${meta.targetLabel}`,
-    ""
-  ];
-
-  if (stdout) {
-    lines.push(stdout);
-  } else if (result.status === 0) {
-    lines.push("Gemini review completed without any stdout output.");
-  } else {
-    lines.push("Gemini review failed.");
-  }
-
-  if (stderr) {
-    lines.push("", "stderr:", "", "```text", stderr, "```");
-  }
-
-  appendReasoningSection(lines, meta.reasoningSummary);
-
-  return `${lines.join("\n").trimEnd()}\n`;
+function formatJobRow(job) {
+  return `| ${job.handle ?? job.id} | ${job.kindLabel} | ${job.displayStatus ?? job.status} | ${job.elapsed ?? job.duration ?? ""} | ${escapeMarkdownCell(job.summary ?? "")} |`;
 }
 
-export function renderTaskResult(parsedResult, meta) {
-  const rawOutput = typeof parsedResult?.rawOutput === "string" ? parsedResult.rawOutput : "";
-  if (rawOutput) {
-    return rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`;
-  }
-
-  const message = String(parsedResult?.failureMessage ?? "").trim() || "Gemini did not return a final message.";
-  return `${message}\n`;
+function escapeMarkdownCell(value) {
+  return String(value ?? "")
+    .replace(/\|/g, "\\|")
+    .replace(/\r?\n/g, " ")
+    .trim();
 }
 
 export function renderStatusReport(report) {
-  const lines = [
-    "# Gemini Status",
-    "",
-    `Session runtime: ${report.sessionRuntime.label}`,
-    `Review gate: ${report.config.stopReviewGate ? "enabled" : "disabled"}`,
-    ""
-  ];
+  const lines = [`Gemini status (review gate ${report.config.stopReviewGate ? "enabled" : "disabled"})`];
 
-  if (report.running.length > 0) {
-    appendActiveJobsTable(lines, report.running);
-    lines.push("");
-    lines.push("Live details:");
-    for (const job of report.running) {
-      pushJobDetails(lines, job, {
-        showElapsed: true,
-        showLog: true
-      });
-    }
-    lines.push("");
+  const rows = [...report.running, ...(report.latestFinished ? [report.latestFinished] : []), ...report.recent];
+  if (rows.length === 0) {
+    lines.push("No jobs recorded yet.");
+    return `${lines.join("\n")}\n`;
   }
 
-  if (report.latestFinished) {
-    lines.push("Latest finished:");
-    pushJobDetails(lines, report.latestFinished, {
-      showDuration: true,
-      showLog: report.latestFinished.status === "failed"
-    });
-    lines.push("");
+  lines.push("", "| Job | Kind | Status | Time | Summary |", "| --- | --- | --- | --- | --- |");
+  for (const job of rows) {
+    lines.push(formatJobRow(job));
   }
 
-  if (report.recent.length > 0) {
-    lines.push("Recent jobs:");
-    for (const job of report.recent) {
-      pushJobDetails(lines, job, {
-        showDuration: true,
-        showLog: job.status === "failed"
-      });
-    }
-    lines.push("");
-  } else if (report.running.length === 0 && !report.latestFinished) {
-    lines.push("No jobs recorded yet.", "");
+  const active = report.running.filter((job) => !job.stalled);
+  if (active.length > 0) {
+    lines.push("", `Active: ${active.map((job) => job.handle ?? job.id).join(", ")} — result replays with /gemini:result <job> once finished; cancel with /gemini:cancel <job>.`);
   }
-
-  if (report.needsReview) {
-    lines.push("The stop-time review gate is enabled.");
-    lines.push("Ending the session will trigger a fresh Gemini adversarial review and block if it finds issues.");
+  const stalled = report.running.filter((job) => job.stalled);
+  if (stalled.length > 0) {
+    lines.push("", `Stalled (process gone): ${stalled.map((job) => job.handle ?? job.id).join(", ")} — cancel to clear, then retry.`);
   }
 
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
 export function renderJobStatusReport(job) {
-  const lines = ["# Gemini Job Status", ""];
-  pushJobDetails(lines, job, {
-    showElapsed: job.status === "queued" || job.status === "running",
-    showDuration: job.status !== "queued" && job.status !== "running",
-    showLog: true,
-    showCancelHint: true,
-    showResultHint: true,
-    showReviewHint: true
-  });
+  const lines = [
+    `Job ${job.handle ?? job.id}: ${job.displayStatus ?? job.status}${job.phase && job.phase !== job.status ? ` (${job.phase})` : ""}`
+  ];
+  if (job.title) lines.push(`- ${job.title}${job.summary ? ` — ${escapeMarkdownCell(job.summary)}` : ""}`);
+  if (job.elapsed && (job.status === "queued" || job.status === "running")) lines.push(`- Elapsed: ${job.elapsed}`);
+  if (job.duration && job.status !== "queued" && job.status !== "running") lines.push(`- Duration: ${job.duration}`);
+  if (job.conversationId) lines.push(`- Conversation: ${job.conversationId}`);
+  if (job.errorMessage) lines.push(`- Error: ${job.errorMessage}`);
+  if (job.logFile && (job.status === "failed" || job.stalled)) lines.push(`- Log: ${job.logFile}`);
+  if (job.status === "queued" || job.status === "running") {
+    lines.push(`- Cancel: /gemini:cancel ${job.handle ?? job.id}`);
+  } else {
+    lines.push(`- Result: /gemini:result ${job.handle ?? job.id}`);
+  }
+  if (job.progressPreview?.length) {
+    lines.push("- Recent progress:");
+    for (const line of job.progressPreview) {
+      lines.push(`  - ${line}`);
+    }
+  }
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
+// The stored rendering already ends with the run's footer.
 export function renderStoredJobResult(job, storedJob) {
-  const threadId = storedJob?.threadId ?? job.threadId ?? null;
-  const resumeCommand = threadId ? `gemini --resume ${threadId}` : null;
-  if (isStructuredReviewStoredResult(storedJob) && storedJob?.rendered) {
-    const output = storedJob.rendered.endsWith("\n") ? storedJob.rendered : `${storedJob.rendered}\n`;
-    if (!threadId) {
-      return output;
-    }
-    return `${output}\nGemini session ID: ${threadId}\nResume in Gemini: ${resumeCommand}\n`;
-  }
-
-  const rawOutput =
-    (typeof storedJob?.result?.rawOutput === "string" && storedJob.result.rawOutput) ||
-    (typeof storedJob?.result?.gemini?.stdout === "string" && storedJob.result.gemini.stdout) ||
-    "";
-  if (rawOutput) {
-    const output = rawOutput.endsWith("\n") ? rawOutput : `${rawOutput}\n`;
-    if (!threadId) {
-      return output;
-    }
-    return `${output}\nGemini session ID: ${threadId}\nResume in Gemini: ${resumeCommand}\n`;
-  }
-
-  if (storedJob?.rendered) {
-    const output = storedJob.rendered.endsWith("\n") ? storedJob.rendered : `${storedJob.rendered}\n`;
-    if (!threadId) {
-      return output;
-    }
-    return `${output}\nGemini session ID: ${threadId}\nResume in Gemini: ${resumeCommand}\n`;
+  const rendered = storedJob?.rendered;
+  if (typeof rendered === "string" && rendered.trim()) {
+    return rendered.endsWith("\n") ? rendered : `${rendered}\n`;
   }
 
   const lines = [
-    `# ${job.title ?? "Gemini Result"}`,
-    "",
-    `Job: ${job.id}`,
-    `Status: ${job.status}`
+    `Job ${job.handle ?? job.id}: ${job.status}`
   ];
-
-  if (threadId) {
-    lines.push(`Gemini session ID: ${threadId}`);
-    lines.push(`Resume in Gemini: ${resumeCommand}`);
-  }
-
-  if (job.summary) {
-    lines.push(`Summary: ${job.summary}`);
-  }
-
-  if (job.errorMessage) {
-    lines.push("", job.errorMessage);
-  } else if (storedJob?.errorMessage) {
-    lines.push("", storedJob.errorMessage);
+  if (job.summary) lines.push(`- ${escapeMarkdownCell(job.summary)}`);
+  if (job.conversationId) lines.push(`- Conversation: ${job.conversationId}`);
+  const errorMessage = job.errorMessage ?? storedJob?.errorMessage;
+  if (errorMessage) {
+    lines.push("", errorMessage);
   } else {
     lines.push("", "No captured result payload was stored for this job.");
   }
-
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
-export function renderCancelReport(job) {
+export function renderCancelReport(job, { interrupted = false } = {}) {
   const lines = [
-    "# Gemini Cancel",
-    "",
-    `Cancelled ${job.id}.`,
-    ""
+    `Cancelled ${job.handle ?? job.id}${job.title ? ` (${job.title})` : ""}.`
   ];
-
-  if (job.title) {
-    lines.push(`- Title: ${job.title}`);
+  if (interrupted) {
+    lines.push("The running agy process tree was signalled.");
   }
-  if (job.summary) {
-    lines.push(`- Summary: ${job.summary}`);
-  }
-  lines.push("- Check `/gemini:status` for the updated queue.");
-
-  return `${lines.join("\n").trimEnd()}\n`;
+  return `${lines.join("\n")}\n`;
 }

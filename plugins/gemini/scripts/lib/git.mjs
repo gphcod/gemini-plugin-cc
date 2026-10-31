@@ -6,7 +6,7 @@ import { formatCommandFailure, runCommand, runCommandChecked } from "./process.m
 
 const MAX_UNTRACKED_BYTES = 24 * 1024;
 const MAX_AGGREGATE_UNTRACKED_BYTES = 128 * 1024;
-const DEFAULT_INLINE_DIFF_MAX_FILES = 2;
+const DEFAULT_INLINE_DIFF_MAX_FILES = 25;
 const DEFAULT_INLINE_DIFF_MAX_BYTES = 256 * 1024;
 
 function git(cwd, args, options = {}) {
@@ -334,7 +334,7 @@ function buildAdversarialCollectionGuidance(options = {}) {
     return "Use the repository context below as primary evidence.";
   }
 
-  return "The repository context below is a lightweight summary. Inspect the target diff yourself with read-only git commands before finalizing findings.";
+  return "The repository context below is a lightweight summary because the diff is large. Inspect the target diff yourself with read-only git commands, working file by file through the changed-files list, before finalizing findings.";
 }
 
 export function collectReviewContext(cwd, target, options = {}) {

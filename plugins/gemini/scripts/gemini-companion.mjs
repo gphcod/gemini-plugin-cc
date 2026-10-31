@@ -1,41 +1,41 @@
 #!/usr/bin/env node
 
-import { spawn } from "node:child_process";
+// Companion CLI for the Gemini plugin. Every model turn is one agy process
+// (see lib/agy.mjs); there is no broker, daemon, or self-detaching worker.
+// Long runs are backgrounded by the caller (Claude's run_in_background Bash),
+// and status/result/wait/cancel operate on the per-workspace job store.
+
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
-import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
-import {
-  buildPersistentTaskThreadName,
-  DEFAULT_CONTINUE_PROMPT,
-  findLatestTaskSession,
-  getGeminiAuthStatus,
-  getGeminiAvailability,
-  getSessionRuntimeStatus,
-  interruptAcpTurn,
-  parseStructuredOutput,
-  readOutputSchema,
-  runAcpReview,
-  runAcpTurn,
-  verifyGeminiConnectivity
-} from "./lib/gemini.mjs";
-import { readStdinIfPiped } from "./lib/fs.mjs";
+import { parseArgs, parseProseCommand, splitRawArgumentString } from "./lib/args.mjs";
+import { DEFAULT_TIMEOUT_SECONDS, isDeniedFailure, runAgy } from "./lib/agy.mjs";
+import { readStdinIfPiped, STDIN_INACTIVITY_MS, StdinTimeoutError } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
-import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
+import { binaryAvailable, runCommand, stopProcessGroup, terminateProcessTree } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
+import { parseStructuredOutput } from "./lib/review-output.mjs";
 import {
+  claimRequestId,
+  generateJobHandle,
   generateJobId,
   getConfig,
   listJobs,
+  markJobCancelled,
+  patchJobRecord,
+  removeJobRecord,
   setConfig,
-  upsertJob,
-  writeJobFile
+  writeAnswerFile,
+  writeJobRecord
 } from "./lib/state.mjs";
 import {
   buildSingleJobSnapshot,
   buildStatusSnapshot,
+  isActiveJobStatus,
+  isJobStalled,
+  matchJobReference,
   readStoredJob,
   resolveCancelableJob,
   resolveResultJob,
@@ -50,49 +50,65 @@ import {
   createProgressReporter,
   nowIso,
   runTrackedJob,
-  SESSION_ID_ENV
+  startJobHeartbeat,
+  watchForCancel
 } from "./lib/tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 import {
-  renderReviewResult,
-  renderStoredJobResult,
+  capAnswer,
   renderCancelReport,
+  renderFooter,
   renderJobStatusReport,
+  renderReviewResult,
   renderSetupReport,
   renderStatusReport,
-  renderTaskResult
+  renderStoredJobResult
 } from "./lib/render.mjs";
 
 const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "review-output.schema.json");
 const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
-const VALID_REASONING_EFFORTS = new Set(["low", "medium", "high"]);
+const VALID_REASONING_EFFORTS = new Set(["low", "medium", "high", "xhigh", "max"]);
 
-const MODEL_ALIASES = new Map([
-  ["pro", "gemini-3.1-pro-preview"],
-  ["pro-3", "gemini-3.1-pro-preview"],
-  ["flash", "gemini-3-flash-preview"],
-  ["flash-lite", "gemini-3.1-flash-lite-preview"],
-  ["2.5-pro", "gemini-2.5-pro"],
-  ["2.5-flash", "gemini-2.5-flash"],
-  ["2.5-flash-lite", "gemini-2.5-flash-lite"],
-  ["auto", "auto-gemini-3"],
-  ["auto-2.5", "auto-gemini-2.5"]
-]);
-const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
+export const EXIT_OK = 0;
+export const EXIT_FINDINGS = 10;
+export const EXIT_DENIED = 20;
+export const EXIT_FAILURE = 1;
+export const EXIT_USAGE = 2;
+
+class UsageError extends Error {}
+
+// Aborts the in-flight agy run (killing its whole process tree) when the
+// companion itself is signalled, e.g. by /gemini:cancel or a Bash timeout.
+const turnAbort = new AbortController();
+let signalled = false;
+for (const signalName of ["SIGTERM", "SIGINT"]) {
+  process.on(signalName, () => {
+    signalled = true;
+    turnAbort.abort();
+    setTimeout(() => process.exit(EXIT_FAILURE), 5000).unref();
+  });
+}
+
+// Set while a tracked job runs; aborts the turn when the job's cancel marker
+// exists. Called right before agy is launched.
+let consumeCancel = () => false;
 
 function printUsage() {
   console.log(
     [
       "Usage:",
-      "  node scripts/gemini-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
-      "  node scripts/gemini-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
-      "  node scripts/gemini-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
-      "  node scripts/gemini-companion.mjs task [--background] [--write] [--plan] [--resume-last|--resume|--fresh] [--model <model|alias>] [--effort <low|medium|high>] [prompt]",
-      "  node scripts/gemini-companion.mjs status [job-id] [--all] [--json]",
-      "  node scripts/gemini-companion.mjs result [job-id] [--json]",
-      "  node scripts/gemini-companion.mjs cancel [job-id] [--json]"
+      "  gemini-companion.mjs setup [--verify] [--enable-review-gate|--disable-review-gate] [--json]",
+      "  gemini-companion.mjs task [--plan] [--no-sandbox] [--model <m>] [--effort <low|medium|high|xhigh|max>] [--conversation <id>] [--timeout <s>] [--request-id <id>] [--json] [prompt]",
+      "  gemini-companion.mjs reply [--job <handle>] [same flags as task] [prompt]",
+      "  gemini-companion.mjs review|adversarial-review [--base <ref>] [--scope <auto|working-tree|branch>] [--model <m>] [--timeout <s>] [--request-id <id>] [--json] [focus]",
+      "  gemini-companion.mjs status [job] [--all] [--wait] [--json]",
+      "  gemini-companion.mjs result [job] [--json]",
+      "  gemini-companion.mjs wait [job] [--timeout-ms <ms>] [--json]",
+      "  gemini-companion.mjs cancel [job] [--json]",
+      "",
+      "Exit codes: 0 ok, 10 review findings, 20 action denied, 1 failure, 2 usage."
     ].join("\n")
   );
 }
@@ -109,26 +125,31 @@ function outputCommandResult(payload, rendered, asJson) {
   outputResult(asJson ? payload : rendered, asJson);
 }
 
-function normalizeRequestedModel(model) {
-  if (model == null) return null;
-  const normalized = String(model).trim();
-  if (!normalized) return null;
-  return MODEL_ALIASES.get(normalized.toLowerCase()) ?? normalized;
+function normalizeModel(model) {
+  const normalized = String(model ?? "").trim();
+  return normalized || null;
 }
 
-function normalizeReasoningEffort(effort) {
+function normalizeEffort(effort) {
   if (effort == null) return null;
   const normalized = String(effort).trim().toLowerCase();
   if (!normalized) return null;
   if (!VALID_REASONING_EFFORTS.has(normalized)) {
-    throw new Error(
-      `Unsupported reasoning effort "${effort}". Use one of: low, medium, high.`
-    );
+    throw new UsageError(`Unsupported reasoning effort "${effort}". Use one of: low, medium, high, xhigh, max.`);
   }
   return normalized;
 }
 
-function normalizeArgv(argv) {
+function normalizeTimeoutSeconds(value) {
+  if (value == null) return DEFAULT_TIMEOUT_SECONDS;
+  const seconds = Number(value);
+  if (!Number.isFinite(seconds) || seconds <= 0 || seconds * 1000 > Number.MAX_SAFE_INTEGER) {
+    throw new UsageError(`--timeout must be positive seconds. Received: ${value}`);
+  }
+  return seconds;
+}
+
+function normalizeArgvForFlags(argv) {
   if (argv.length === 1) {
     const [raw] = argv;
     if (!raw || !raw.trim()) return [];
@@ -137,22 +158,21 @@ function normalizeArgv(argv) {
   return argv;
 }
 
-function parseCommandInput(argv, config = {}) {
-  return parseArgs(normalizeArgv(argv), {
+function parseFlagCommand(argv, config = {}) {
+  return parseArgs(normalizeArgvForFlags(argv), {
     ...config,
-    aliasMap: {
-      C: "cwd",
-      ...(config.aliasMap ?? {})
-    }
+    aliasMap: { C: "cwd", ...(config.aliasMap ?? {}) }
   });
 }
 
+const PROSE_RUNTIME_FLAGS = {
+  valueOptions: ["model", "effort", "cwd", "timeout", "conversation", "request-id", "prompt-file", "base", "scope", "job"],
+  booleanOptions: ["json", "plan", "no-sandbox", "sandbox", "stop-gate", "wait", "background", "resume", "fresh"],
+  aliasMap: { m: "model", C: "cwd" }
+};
+
 function resolveCommandCwd(options = {}) {
   return options.cwd ? path.resolve(process.cwd(), options.cwd) : process.cwd();
-}
-
-function resolveCommandWorkspace(options = {}) {
-  return resolveWorkspaceRoot(resolveCommandCwd(options));
 }
 
 function sleep(ms) {
@@ -166,43 +186,53 @@ function shorten(text, limit = 96) {
   return `${normalized.slice(0, limit - 3)}...`;
 }
 
-function firstMeaningfulLine(text, fallback) {
-  const line = String(text ?? "")
-    .split(/\r?\n/)
-    .map((value) => value.trim())
-    .find(Boolean);
-  return line ?? fallback;
+function formatDuration(seconds) {
+  if (!Number.isFinite(seconds) || seconds < 0) return null;
+  const total = Math.round(seconds);
+  if (total < 60) return `${total}s`;
+  const minutes = Math.floor(total / 60);
+  if (minutes < 60) return `${minutes}m ${total % 60}s`;
+  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+}
+
+// --- setup ---------------------------------------------------------------
+
+function getAgyAuthStatus(cwd) {
+  const probe = runCommand("agy", ["models"], { cwd, timeout: 30000 });
+  if (probe.error && probe.error.code === "ENOENT") {
+    return { loggedIn: false, detail: "agy is not installed" };
+  }
+  if (probe.error) {
+    return { loggedIn: false, detail: probe.error.message };
+  }
+  if (probe.status !== 0) {
+    const detail = probe.stderr.trim() || probe.stdout.trim() || `agy models exited ${probe.status}`;
+    return { loggedIn: false, detail: shorten(detail, 200) };
+  }
+  const modelCount = probe.stdout.split(/\r?\n/).filter((line) => /\S\t/.test(line)).length;
+  return { loggedIn: true, detail: `signed in (agy models lists ${modelCount} model${modelCount === 1 ? "" : "s"})` };
 }
 
 async function buildSetupReport(cwd, actionsTaken = []) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const nodeStatus = binaryAvailable("node", ["--version"], { cwd });
-  const npmStatus = binaryAvailable("npm", ["--version"], { cwd });
-  const geminiStatus = getGeminiAvailability(cwd);
-  const authStatus = await getGeminiAuthStatus(cwd);
+  const agyStatus = binaryAvailable("agy", ["--version"], { cwd });
+  const authStatus = agyStatus.available ? getAgyAuthStatus(cwd) : { loggedIn: false, detail: "agy is not installed" };
   const config = getConfig(workspaceRoot);
 
   const nextSteps = [];
-  if (!geminiStatus.available) {
-    nextSteps.push("Install Gemini CLI with `npm install -g @google/gemini-cli@0.38.2`.");
+  if (!agyStatus.available) {
+    nextSteps.push("Install the Antigravity CLI from https://antigravity.google/docs/cli/install/ and rerun /gemini:setup.");
   }
-  if (geminiStatus.available && !authStatus.loggedIn) {
-    nextSteps.push("Configure Gemini auth: edit `<repo>/.gemini/settings.json` (project-scoped) or `~/.gemini/settings.json` (user-level), or run `gemini auth` in a terminal outside Claude Code.");
-    if (authStatus.authMethod === "vertex-ai") {
-      nextSteps.push("For Vertex AI, set `GOOGLE_CLOUD_PROJECT` and `GOOGLE_CLOUD_LOCATION` in your shell.");
-    }
-  }
-  if (!config.stopReviewGate) {
-    nextSteps.push("Optional: run `/gemini:setup --enable-review-gate` to block stops until Gemini reviews the work.");
+  if (agyStatus.available && !authStatus.loggedIn) {
+    nextSteps.push("Authenticate by running `agy` once in a terminal outside Claude Code, then rerun /gemini:setup.");
   }
 
   return {
-    ready: nodeStatus.available && geminiStatus.available && authStatus.loggedIn,
+    ready: nodeStatus.available && agyStatus.available && authStatus.loggedIn,
     node: nodeStatus,
-    npm: npmStatus,
-    gemini: geminiStatus,
+    agy: agyStatus,
     auth: authStatus,
-    sessionRuntime: getSessionRuntimeStatus(process.env, workspaceRoot),
     reviewGateEnabled: Boolean(config.stopReviewGate),
     actionsTaken,
     nextSteps
@@ -210,17 +240,17 @@ async function buildSetupReport(cwd, actionsTaken = []) {
 }
 
 async function handleSetup(argv) {
-  const { options } = parseCommandInput(argv, {
+  const { options } = parseFlagCommand(argv, {
     valueOptions: ["cwd"],
     booleanOptions: ["json", "verify", "enable-review-gate", "disable-review-gate"]
   });
 
   if (options["enable-review-gate"] && options["disable-review-gate"]) {
-    throw new Error("Choose either --enable-review-gate or --disable-review-gate.");
+    throw new UsageError("Choose either --enable-review-gate or --disable-review-gate.");
   }
 
   const cwd = resolveCommandCwd(options);
-  const workspaceRoot = resolveCommandWorkspace(options);
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
   const actionsTaken = [];
 
   if (options["enable-review-gate"]) {
@@ -231,30 +261,345 @@ async function handleSetup(argv) {
     actionsTaken.push(`Disabled the stop-time review gate for ${workspaceRoot}.`);
   }
 
-  const finalReport = await buildSetupReport(cwd, actionsTaken);
+  const report = await buildSetupReport(cwd, actionsTaken);
 
-  if (options.verify && finalReport.gemini.available) {
-    const connectivity = await verifyGeminiConnectivity(cwd);
-    finalReport.auth.verified = connectivity.verified;
-    finalReport.auth.verifyDetail = connectivity.detail;
-    if (!connectivity.verified) {
-      finalReport.ready = false;
-      finalReport.nextSteps = finalReport.nextSteps ?? [];
-      finalReport.nextSteps.push(`Verification failed: ${connectivity.detail}`);
+  if (options.verify && report.agy.available) {
+    const verify = await runAgy(
+      { task: "Respond with exactly: ok", cwd: workspaceRoot, mode: "plan", timeoutSeconds: 120 },
+      { signal: turnAbort.signal }
+    );
+    report.auth.verified = verify.ok;
+    if (!verify.ok) {
+      report.ready = false;
+      report.auth.detail = `live check failed: ${shorten(verify.error ?? "unknown", 200)}`;
+      report.nextSteps.push("The live verification call failed; check the auth detail above.");
+    } else {
+      report.auth.detail += ", live check passed";
     }
   }
 
-  if (!options.verify && finalReport.auth.loggedIn && finalReport.auth.verified === null) {
-    finalReport.nextSteps = finalReport.nextSteps ?? [];
-    finalReport.nextSteps.push("Run with --verify to confirm credentials work end-to-end.");
+  outputResult(options.json ? report : renderSetupReport(report), options.json);
+  if (!report.ready) {
+    process.exitCode = EXIT_FAILURE;
   }
-
-  outputResult(options.json ? finalReport : renderSetupReport(finalReport), options.json);
 }
 
+// --- shared job helpers ---------------------------------------------------
+
+function createCompanionJob({ prefix, kind, kindLabel, title, workspaceRoot, jobClass, summary, stopGate = false, requestId = null }) {
+  return createJobRecord({
+    id: generateJobId(prefix),
+    handle: generateJobHandle(listJobs(workspaceRoot)),
+    kind,
+    kindLabel,
+    title,
+    workspaceRoot,
+    jobClass,
+    summary,
+    stopGate,
+    requestId
+  });
+}
+
+// Registers the job, then claims its --request-id by creating the claim file
+// exclusively. Of concurrent calls sharing an id exactly one claim succeeds;
+// the others drop their record and replay the winner's job.
+function reserveJob(workspaceRoot, requestId, jobSpec) {
+  const job = createCompanionJob({ ...jobSpec, workspaceRoot, requestId });
+  writeJobRecord(workspaceRoot, { ...job, status: "queued", phase: "queued", pid: process.pid, heartbeatAt: nowIso() });
+  if (requestId) {
+    const claim = claimRequestId(workspaceRoot, requestId, job.id);
+    if (!claim.claimed) {
+      removeJobRecord(workspaceRoot, job.id);
+      const twin = listJobs(workspaceRoot).find((entry) => entry.id === claim.jobId);
+      if (!twin) {
+        throw new Error(`Request ${requestId} belongs to a job that is no longer recorded. Retry with a new --request-id.`);
+      }
+      return { twin };
+    }
+  }
+  return { job };
+}
+
+function createTrackedProgress(job) {
+  const logFile = createJobLogFile(job.workspaceRoot, job.id, job.title);
+  return {
+    logFile,
+    progress: createProgressReporter({
+      logFile,
+      onEvent: createJobProgressUpdater(job.workspaceRoot, job.id)
+    })
+  };
+}
+
+function agyEventToProgress(event, progress) {
+  if (!progress) return;
+  if (event.event === "init") {
+    progress({ message: `conversation ${event.conversation_id ?? "started"}`, phase: "running", conversationId: event.conversation_id ?? null });
+    return;
+  }
+  const step = event.step_update;
+  if (event.event === "step_update" && step && typeof step === "object") {
+    if (step.step_type === "agent_response" && step.state === "ACTIVE") {
+      progress({ message: "", phase: "responding", conversationId: step.conversation_id ?? null });
+    } else if (step.step_type === "tool" && step.state === "ACTIVE") {
+      progress({ message: `tool: ${step.tool_name ?? step.tool_info?.name ?? "unknown"}`, phase: "working" });
+    } else if (step.state === "ERROR") {
+      progress({ message: `step error: ${String(step.error ?? step.step_type ?? "unknown").slice(0, 200)}` });
+    }
+  }
+}
+
+async function runForegroundCommand(job, runner, options = {}) {
+  const { logFile, progress } = createTrackedProgress(job);
+  if (!options.json) {
+    process.stderr.write(`[gemini] job ${job.handle} ${job.kindLabel} started\n`);
+  }
+  const stopHeartbeat = startJobHeartbeat(job.workspaceRoot, job.id);
+  const cancelWatch = watchForCancel(job.workspaceRoot, job.id, () => turnAbort.abort());
+  consumeCancel = cancelWatch.check;
+  let execution;
+  try {
+    execution = await runTrackedJob(job, () => runner(progress, logFile), { logFile });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const envelope = {
+      status: "error",
+      message: signalled ? `Cancelled: ${message}` : message,
+      jobId: job?.id ?? null,
+      handle: job?.handle ?? null,
+      stderr: error instanceof Error && error.stack ? error.stack : null
+    };
+    if (options.json) {
+      outputResult(envelope, true);
+    } else {
+      process.stderr.write(`Gemini companion failed: ${envelope.message}\n`);
+      outputResult(`${renderFooter({ status: "failed", handle: job.handle, hint: `log: ${logFile}` })}\n`, false);
+    }
+    process.exitCode = EXIT_FAILURE;
+    return { exitStatus: EXIT_FAILURE, payload: envelope, rendered: envelope.message };
+  } finally {
+    stopHeartbeat();
+    cancelWatch.stop();
+    consumeCancel = () => false;
+  }
+  outputResult(options.json ? execution.payload : execution.rendered, options.json);
+  if (execution.exitStatus !== 0) {
+    process.exitCode = execution.exitStatus;
+  }
+  return execution;
+}
+
+// Safe retries: a rerun with the same --request-id replays the stored result
+// instead of starting a second agy. A twin that is still running is awaited.
+async function replayTwin(workspaceRoot, twin, requestId, options) {
+  let current = twin;
+  const deadline = Date.now() + (Number(options.timeoutSeconds) || DEFAULT_TIMEOUT_SECONDS) * 1000 + 30_000;
+  while (isActiveJobStatus(current.status) && !isJobStalled(current) && Date.now() < deadline) {
+    await sleep(DEFAULT_STATUS_POLL_INTERVAL_MS / 4);
+    current = matchJobReference(listJobs(workspaceRoot), current.id);
+  }
+
+  if (isActiveJobStatus(current.status)) {
+    throw new Error(
+      isJobStalled(current)
+        ? `Request ${requestId} (job ${current.handle ?? current.id}) stopped without a result. Cancel it, then retry with a new --request-id.`
+        : `Request ${requestId} is still running as job ${current.handle ?? current.id}. Check /gemini:status.`
+    );
+  }
+
+  const storedJob = readStoredJob(workspaceRoot, current.id);
+  outputCommandResult({ replayed: true, job: current, storedJob }, renderStoredJobResult(current, storedJob), options.json);
+  const exitStatus = Number.isInteger(storedJob?.exitStatus) ? storedJob.exitStatus : current.status === "completed" ? EXIT_OK : EXIT_FAILURE;
+  if (exitStatus !== 0) {
+    process.exitCode = exitStatus;
+  }
+}
+
+// --- task / reply ---------------------------------------------------------
+
+async function readTaskPrompt(cwd, options, text) {
+  if (options["prompt-file"]) {
+    return fs.readFileSync(path.resolve(cwd, options["prompt-file"]), "utf8");
+  }
+  if (text) {
+    return text;
+  }
+  const inactivityMs = Number(process.env.GEMINI_COMPANION_STDIN_TIMEOUT_MS) || STDIN_INACTIVITY_MS;
+  try {
+    return await readStdinIfPiped({ inactivityMs });
+  } catch (error) {
+    throw error instanceof StdinTimeoutError ? new UsageError(error.message) : error;
+  }
+}
+
+function findLatestResumableJob(jobs) {
+  return (
+    jobs.find(
+      (job) =>
+        job.conversationId &&
+        !job.stopGate &&
+        !isActiveJobStatus(job.status)
+    ) ?? null
+  );
+}
+
+async function executeTaskRun(request, progress) {
+  const startedAt = Date.now();
+  consumeCancel();
+  const outcome = await runAgy(
+    {
+      task: request.prompt,
+      model: request.model,
+      effort: request.effort,
+      conversation: request.conversation,
+      cwd: request.workspaceRoot,
+      timeoutSeconds: request.timeoutSeconds,
+      sandbox: request.sandbox,
+      mode: request.plan ? "plan" : "accept-edits"
+    },
+    {
+      signal: turnAbort.signal,
+      onEvent: (event) => agyEventToProgress(event, progress),
+      onSpawn: (pid) => {
+        if (pid) patchJobRecord(request.workspaceRoot, request.jobId, { agyPid: pid });
+      },
+      onStderr: (chunk) => progress?.(String(chunk).trim())
+    }
+  );
+
+  const durationSeconds = Number(outcome.result?.duration_seconds) || (Date.now() - startedAt) / 1000;
+  const answer = typeof outcome.result?.response === "string" && outcome.result.response.trim()
+    ? outcome.result.response
+    : outcome.partial;
+  const answerFile = writeAnswerFile(request.workspaceRoot, request.jobId, answer || outcome.error || "");
+
+  const denied = isDeniedFailure(outcome.result);
+  const exitStatus = outcome.ok ? EXIT_OK : denied ? EXIT_DENIED : EXIT_FAILURE;
+
+  let body;
+  let truncated = false;
+  if (outcome.ok) {
+    const capped = capAnswer(answer);
+    truncated = capped.truncated;
+    body = capped.text.endsWith("\n") ? capped.text : `${capped.text}\n`;
+  } else {
+    const detail = outcome.error ?? "agy failed without detail.";
+    body = `${detail.trim()}\n`;
+    if (answer.trim()) {
+      const capped = capAnswer(answer);
+      truncated = capped.truncated;
+      body += `\nPartial response:\n${capped.text.endsWith("\n") ? capped.text : `${capped.text}\n`}`;
+    }
+  }
+  const footer = renderFooter({
+    status: outcome.ok ? "ok" : denied ? "denied" : "failed",
+    handle: request.handle,
+    duration: formatDuration(durationSeconds),
+    answerFile: truncated ? answerFile : null
+  });
+
+  return {
+    exitStatus,
+    jobStatus: outcome.ok ? "completed" : "failed",
+    conversationId: outcome.conversationId,
+    answerFile,
+    payload: {
+      ok: outcome.ok,
+      exitStatus,
+      jobId: request.jobId,
+      handle: request.handle,
+      conversationId: outcome.conversationId,
+      rawOutput: answer,
+      error: outcome.error,
+      deniedActions: outcome.result?.denied_actions ?? [],
+      usage: outcome.result?.usage ?? null,
+      answerFile
+    },
+    rendered: `${body}${footer}\n`,
+    summary: shorten(answer || outcome.error || request.prompt)
+  };
+}
+
+async function handleTaskLike(argv, { reply: replyCommand = false } = {}) {
+  const { options, text } = parseProseCommand(argv, PROSE_RUNTIME_FLAGS);
+  if (options.resume && options.fresh) {
+    throw new UsageError("Choose either --resume or --fresh.");
+  }
+  const reply = replyCommand || Boolean(options.resume);
+
+  const cwd = resolveCommandCwd(options);
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const model = normalizeModel(options.model);
+  const effort = normalizeEffort(options.effort);
+  const timeoutSeconds = normalizeTimeoutSeconds(options.timeout);
+  const plan = Boolean(options.plan);
+  const sandbox = plan ? false : options["no-sandbox"] ? false : true;
+  const stopGate = Boolean(options["stop-gate"]);
+  const requestId = options["request-id"] ?? null;
+  const prompt = (await readTaskPrompt(cwd, options, text)).trim();
+
+  let conversation = options.conversation ?? null;
+  if (reply && !conversation) {
+    const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
+    const source = options.job ? matchJobReference(jobs, options.job) : findLatestResumableJob(jobs);
+    if (!source?.conversationId) {
+      throw new Error(
+        options.job
+          ? `Job ${options.job} has no stored conversation to resume.`
+          : "No previous Gemini conversation was found for this repository. Run a task first."
+      );
+    }
+    conversation = source.conversationId;
+  }
+
+  if (!prompt) {
+    throw new UsageError("Provide a prompt (argument, --prompt-file, or piped stdin).");
+  }
+
+  const title = stopGate ? "Gemini Stop Gate Review" : reply ? "Gemini Reply" : "Gemini Task";
+  const reservation = reserveJob(workspaceRoot, requestId, {
+    prefix: stopGate ? "gate" : "task",
+    kind: "task",
+    kindLabel: reply ? "reply" : "task",
+    title,
+    jobClass: "task",
+    summary: shorten(prompt),
+    stopGate
+  });
+  if (reservation.twin) {
+    await replayTwin(workspaceRoot, reservation.twin, requestId, { json: options.json, timeoutSeconds });
+    return;
+  }
+  const { job } = reservation;
+
+  await runForegroundCommand(
+    job,
+    (progress, logFile) =>
+      executeTaskRun(
+        {
+          prompt,
+          model,
+          effort,
+          conversation,
+          workspaceRoot,
+          timeoutSeconds,
+          sandbox,
+          plan,
+          jobId: job.id,
+          handle: job.handle,
+          logFile
+        },
+        progress
+      ),
+    { json: options.json }
+  );
+}
+
+// --- review ---------------------------------------------------------------
+
 function buildReviewPrompt(context, focusText, reviewName) {
-  const templateName =
-    reviewName === "Adversarial Review" ? "adversarial-review" : "review";
+  const templateName = reviewName === "Adversarial Review" ? "adversarial-review" : "review";
   const template = loadPromptTemplate(ROOT_DIR, templateName);
   return interpolateTemplate(template, {
     REVIEW_KIND: reviewName,
@@ -265,45 +610,152 @@ function buildReviewPrompt(context, focusText, reviewName) {
   });
 }
 
-function ensureGeminiAvailable(cwd) {
-  const availability = getGeminiAvailability(cwd);
-  if (!availability.available) {
-    throw new Error(
-      "Gemini CLI is not installed. Install it with `npm install -g @google/gemini-cli@0.38.2`, then rerun `/gemini:setup`."
-    );
+async function executeReviewRun(request, progress) {
+  ensureGitRepository(request.cwd);
+
+  const target = resolveReviewTarget(request.cwd, {
+    base: request.base,
+    scope: request.scope
+  });
+  const reviewName = request.reviewName ?? "Review";
+  const context = collectReviewContext(request.cwd, target);
+  const prompt = buildReviewPrompt(context, request.focusText?.trim() ?? "", reviewName);
+
+  const startedAt = Date.now();
+  consumeCancel();
+  const outcome = await runAgy(
+    {
+      task: prompt,
+      model: request.model,
+      effort: request.effort,
+      cwd: context.repoRoot,
+      timeoutSeconds: request.timeoutSeconds,
+      mode: "plan",
+      jsonSchemaPath: REVIEW_SCHEMA
+    },
+    {
+      signal: turnAbort.signal,
+      onEvent: (event) => agyEventToProgress(event, progress),
+      onSpawn: (pid) => {
+        if (pid) patchJobRecord(request.workspaceRoot, request.jobId, { agyPid: pid });
+      },
+      onStderr: (chunk) => progress?.(String(chunk).trim())
+    }
+  );
+
+  const durationSeconds = Number(outcome.result?.duration_seconds) || (Date.now() - startedAt) / 1000;
+  const parsed = parseStructuredOutput(outcome.result, {
+    partial: outcome.partial,
+    failureMessage: outcome.error ?? ""
+  });
+  const reviewBody = renderReviewResult(parsed, {
+    reviewLabel: reviewName,
+    targetLabel: context.target.label
+  });
+  const answerFile = writeAnswerFile(request.workspaceRoot, request.jobId, reviewBody);
+
+  const denied = isDeniedFailure(outcome.result);
+  const structuredOk = Boolean(parsed.parsed) && outcome.ok;
+  const hasFindings = structuredOk && Array.isArray(parsed.parsed.findings) && parsed.parsed.findings.length > 0;
+  const needsAttention = structuredOk && (parsed.parsed.verdict === "needs-attention" || hasFindings);
+  const exitStatus = !outcome.ok
+    ? denied ? EXIT_DENIED : EXIT_FAILURE
+    : !parsed.parsed
+      ? EXIT_FAILURE
+      : needsAttention
+        ? EXIT_FINDINGS
+        : EXIT_OK;
+
+  const capped = capAnswer(reviewBody);
+  const footer = renderFooter({
+    status: exitStatus === EXIT_FAILURE ? "failed" : exitStatus === EXIT_DENIED ? "denied" : "ok",
+    handle: request.handle,
+    duration: formatDuration(durationSeconds),
+    answerFile: capped.truncated ? answerFile : null
+  });
+
+  let body = capped.text;
+  if (!outcome.ok && outcome.error) {
+    body = `${body.trimEnd()}\n\nagy error: ${outcome.error.trim()}\n`;
   }
+
+  return {
+    exitStatus,
+    jobStatus: structuredOk ? "completed" : "failed",
+    conversationId: outcome.conversationId,
+    answerFile,
+    payload: {
+      ok: structuredOk,
+      exitStatus,
+      review: reviewName,
+      target,
+      jobId: request.jobId,
+      handle: request.handle,
+      conversationId: outcome.conversationId,
+      result: parsed.parsed,
+      rawOutput: parsed.rawOutput,
+      parseError: parsed.parseError,
+      error: outcome.error,
+      usage: outcome.result?.usage ?? null,
+      answerFile
+    },
+    rendered: `${body.trimEnd()}\n${footer}\n`,
+    summary: parsed.parsed?.summary ?? parsed.parseError ?? `${reviewName} finished.`
+  };
 }
 
-function renderStatusPayload(report, asJson) {
-  return asJson ? report : renderStatusReport(report);
-}
+async function handleReviewCommand(argv, config) {
+  const { options, text } = parseProseCommand(argv, PROSE_RUNTIME_FLAGS);
 
-function isActiveJobStatus(status) {
-  return status === "queued" || status === "running";
-}
+  const cwd = resolveCommandCwd(options);
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const timeoutSeconds = normalizeTimeoutSeconds(options.timeout);
+  const requestId = options["request-id"] ?? null;
+  const focusText = text.trim();
+  const target = resolveReviewTarget(cwd, {
+    base: options.base,
+    scope: options.scope
+  });
 
-function getCurrentClaudeSessionId() {
-  return process.env[SESSION_ID_ENV] ?? null;
-}
+  const kind = config.reviewName === "Adversarial Review" ? "adversarial-review" : "review";
+  const reservation = reserveJob(workspaceRoot, requestId, {
+    prefix: "review",
+    kind,
+    kindLabel: kind,
+    title: `Gemini ${config.reviewName}`,
+    jobClass: "review",
+    summary: `${config.reviewName} ${target.label}`
+  });
+  if (reservation.twin) {
+    await replayTwin(workspaceRoot, reservation.twin, requestId, { json: options.json, timeoutSeconds });
+    return;
+  }
+  const { job } = reservation;
 
-function filterJobsForCurrentClaudeSession(jobs) {
-  const sessionId = getCurrentClaudeSessionId();
-  if (!sessionId) return jobs;
-  return jobs.filter((job) => job.sessionId === sessionId);
-}
-
-function findLatestResumableTaskJob(jobs) {
-  return (
-    jobs.find(
-      (job) =>
-        job.jobClass === "task" &&
-        job.threadId &&
-        !job.stopGate &&
-        job.status !== "queued" &&
-        job.status !== "running"
-    ) ?? null
+  await runForegroundCommand(
+    job,
+    (progress) =>
+      executeReviewRun(
+        {
+          cwd,
+          workspaceRoot,
+          base: options.base,
+          scope: options.scope,
+          model: normalizeModel(options.model),
+          effort: normalizeEffort(options.effort),
+          timeoutSeconds,
+          focusText,
+          reviewName: config.reviewName,
+          jobId: job.id,
+          handle: job.handle
+        },
+        progress
+      ),
+    { json: options.json }
   );
 }
+
+// --- status / result / wait / cancel ---------------------------------------
 
 async function waitForSingleJobSnapshot(cwd, reference, options = {}) {
   const timeoutMs = Math.max(0, Number(options.timeoutMs) || DEFAULT_STATUS_WAIT_TIMEOUT_MS);
@@ -311,519 +763,20 @@ async function waitForSingleJobSnapshot(cwd, reference, options = {}) {
   const deadline = Date.now() + timeoutMs;
   let snapshot = buildSingleJobSnapshot(cwd, reference);
 
-  while (isActiveJobStatus(snapshot.job.status) && Date.now() < deadline) {
+  while (isActiveJobStatus(snapshot.job.status) && !snapshot.job.stalled && Date.now() < deadline) {
     await sleep(Math.min(pollIntervalMs, Math.max(0, deadline - Date.now())));
     snapshot = buildSingleJobSnapshot(cwd, reference);
   }
 
   return {
     ...snapshot,
-    waitTimedOut: isActiveJobStatus(snapshot.job.status),
+    waitTimedOut: isActiveJobStatus(snapshot.job.status) && !snapshot.job.stalled,
     timeoutMs
   };
 }
 
-async function resolveLatestTrackedTaskSession(cwd, options = {}) {
-  const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const sessionId = getCurrentClaudeSessionId();
-  const jobs = sortJobsNewestFirst(listJobs(workspaceRoot)).filter(
-    (job) => job.id !== options.excludeJobId
-  );
-  const visibleJobs = filterJobsForCurrentClaudeSession(jobs);
-  const activeTask = visibleJobs.find(
-    (job) => job.jobClass === "task" && (job.status === "queued" || job.status === "running")
-  );
-  if (activeTask) {
-    throw new Error(
-      `Task ${activeTask.id} is still running. Use /gemini:status before continuing it.`
-    );
-  }
-
-  const trackedTask = findLatestResumableTaskJob(visibleJobs);
-  if (trackedTask) return { id: trackedTask.threadId };
-
-  if (sessionId && !options.explicit) return null;
-
-  return findLatestTaskSession(workspaceRoot);
-}
-
-async function executeReviewRun(request) {
-  ensureGeminiAvailable(request.cwd);
-  ensureGitRepository(request.cwd);
-
-  const target = resolveReviewTarget(request.cwd, {
-    base: request.base,
-    scope: request.scope
-  });
-  const focusText = request.focusText?.trim() ?? "";
-  const reviewName = request.reviewName ?? "Review";
-
-  const context = collectReviewContext(request.cwd, target);
-  const prompt = buildReviewPrompt(context, focusText, reviewName);
-  const result = await runAcpReview(context.repoRoot, {
-    prompt,
-    model: request.model,
-    outputSchema: readOutputSchema(REVIEW_SCHEMA),
-    onProgress: request.onProgress
-  });
-  const parsed = parseStructuredOutput(result.finalMessage, {
-    status: result.status,
-    failureMessage: result.error?.message ?? result.stderr
-  });
-  const payload = {
-    review: reviewName,
-    target,
-    threadId: result.threadId,
-    context: {
-      repoRoot: context.repoRoot,
-      branch: context.branch,
-      summary: context.summary
-    },
-    gemini: {
-      status: result.status,
-      stderr: result.stderr,
-      stdout: result.finalMessage,
-      reasoning: result.reasoningSummary
-    },
-    result: parsed.parsed,
-    rawOutput: parsed.rawOutput,
-    parseError: parsed.parseError,
-    reasoningSummary: result.reasoningSummary
-  };
-
-  return {
-    exitStatus: result.status,
-    threadId: result.threadId,
-    turnId: result.turnId,
-    payload,
-    rendered: renderReviewResult(parsed, {
-      reviewLabel: reviewName,
-      targetLabel: context.target.label,
-      reasoningSummary: result.reasoningSummary
-    }),
-    summary:
-      parsed.parsed?.summary ??
-      parsed.parseError ??
-      firstMeaningfulLine(result.finalMessage, `${reviewName} finished.`),
-    jobTitle: `Gemini ${reviewName}`,
-    jobClass: "review",
-    targetLabel: context.target.label
-  };
-}
-
-async function executeTaskRun(request) {
-  const workspaceRoot = resolveWorkspaceRoot(request.cwd);
-  ensureGeminiAvailable(request.cwd);
-
-  const taskMetadata = buildTaskRunMetadata({
-    prompt: request.prompt,
-    resumeLast: request.resumeLast
-  });
-
-  let resumeSessionId = null;
-  if (request.resumeLast) {
-    const latest = await resolveLatestTrackedTaskSession(workspaceRoot, {
-      excludeJobId: request.jobId,
-      explicit: true
-    });
-    if (!latest) {
-      throw new Error("No previous Gemini task session was found for this repository.");
-    }
-    resumeSessionId = latest.id;
-  }
-
-  if (!request.prompt && !resumeSessionId) {
-    throw new Error("Provide a prompt, a prompt file, piped stdin, or use --resume-last.");
-  }
-
-  const approvalMode = request.plan ? "plan" : request.write ? "yolo" : null;
-  const sandbox = request.plan ? "read-only" : request.write ? "workspace-write" : "read-only";
-
-  const isStopGate = taskMetadata.stopGate;
-  const result = await runAcpTurn(workspaceRoot, {
-    resumeSessionId,
-    prompt: request.prompt,
-    defaultPrompt: resumeSessionId ? DEFAULT_CONTINUE_PROMPT : "",
-    model: request.model,
-    effort: request.effort,
-    sandbox,
-    approvalMode,
-    onProgress: request.onProgress,
-    persistThread: !isStopGate,
-    threadName: resumeSessionId
-      ? null
-      : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT)
-  });
-
-  const rawOutput = typeof result.finalMessage === "string" ? result.finalMessage : "";
-  const failureMessage = result.error?.message ?? result.stderr ?? "";
-  const rendered = renderTaskResult(
-    {
-      rawOutput,
-      failureMessage,
-      reasoningSummary: result.reasoningSummary
-    },
-    {
-      title: taskMetadata.title,
-      jobId: request.jobId ?? null,
-      write: Boolean(request.write)
-    }
-  );
-  const payload = {
-    status: result.status,
-    threadId: result.threadId,
-    rawOutput,
-    touchedFiles: result.touchedFiles,
-    reasoningSummary: result.reasoningSummary
-  };
-
-  return {
-    exitStatus: result.status,
-    threadId: result.threadId,
-    turnId: result.turnId,
-    payload,
-    rendered,
-    summary: firstMeaningfulLine(
-      rawOutput,
-      firstMeaningfulLine(failureMessage, `${taskMetadata.title} finished.`)
-    ),
-    jobTitle: taskMetadata.title,
-    jobClass: "task",
-    stopGate: isStopGate,
-    write: Boolean(request.write)
-  };
-}
-
-function buildReviewJobMetadata(reviewName, target) {
-  return {
-    kind: reviewName === "Adversarial Review" ? "adversarial-review" : "review",
-    title: `Gemini ${reviewName}`,
-    summary: `${reviewName} ${target.label}`
-  };
-}
-
-function buildTaskRunMetadata({ prompt, resumeLast = false }) {
-  if (!resumeLast && String(prompt ?? "").includes(STOP_REVIEW_TASK_MARKER)) {
-    return {
-      title: "Gemini Stop Gate Review",
-      summary: "Stop-gate review of previous Claude turn",
-      stopGate: true
-    };
-  }
-
-  const title = resumeLast ? "Gemini Resume" : "Gemini Task";
-  const fallbackSummary = resumeLast ? DEFAULT_CONTINUE_PROMPT : "Task";
-  return {
-    title,
-    summary: shorten(prompt || fallbackSummary),
-    stopGate: false
-  };
-}
-
-function renderQueuedTaskLaunch(payload) {
-  return `${payload.title} started in the background as ${payload.jobId}. Check /gemini:status ${payload.jobId} for progress.\n`;
-}
-
-function getJobKindLabel(kind, jobClass) {
-  if (kind === "adversarial-review") return "adversarial-review";
-  return jobClass === "review" ? "review" : "rescue";
-}
-
-function createCompanionJob({ prefix, kind, title, workspaceRoot, jobClass, summary, write = false, stopGate = false }) {
-  return createJobRecord({
-    id: generateJobId(prefix),
-    kind,
-    kindLabel: getJobKindLabel(kind, jobClass),
-    title,
-    workspaceRoot,
-    jobClass,
-    summary,
-    write,
-    stopGate
-  });
-}
-
-function createTrackedProgress(job, options = {}) {
-  const logFile = options.logFile ?? createJobLogFile(job.workspaceRoot, job.id, job.title);
-  return {
-    logFile,
-    progress: createProgressReporter({
-      stderr: Boolean(options.stderr),
-      logFile,
-      onEvent: createJobProgressUpdater(job.workspaceRoot, job.id)
-    })
-  };
-}
-
-function buildTaskJob(workspaceRoot, taskMetadata, write) {
-  return createCompanionJob({
-    prefix: "task",
-    kind: "task",
-    title: taskMetadata.title,
-    workspaceRoot,
-    jobClass: "task",
-    summary: taskMetadata.summary,
-    stopGate: taskMetadata.stopGate,
-    write
-  });
-}
-
-function buildTaskRequest({ cwd, model, effort, prompt, write, plan, resumeLast, jobId }) {
-  return { cwd, model, effort, prompt, write, plan, resumeLast, jobId };
-}
-
-function readTaskPrompt(cwd, options, positionals) {
-  if (options["prompt-file"]) {
-    return fs.readFileSync(path.resolve(cwd, options["prompt-file"]), "utf8");
-  }
-
-  const positionalPrompt = positionals.join(" ");
-  return positionalPrompt || readStdinIfPiped();
-}
-
-function requireTaskRequest(prompt, resumeLast) {
-  if (!prompt && !resumeLast) {
-    throw new Error("Provide a prompt, a prompt file, piped stdin, or use --resume-last.");
-  }
-}
-
-async function runForegroundCommand(job, runner, options = {}) {
-  const { logFile, progress } = createTrackedProgress(job, {
-    logFile: options.logFile,
-    stderr: !options.json
-  });
-  let execution;
-  try {
-    execution = await runTrackedJob(job, () => runner(progress), { logFile });
-  } catch (error) {
-    const envelope = {
-      status: "error",
-      message: error instanceof Error ? error.message : String(error),
-      jobId: job?.id ?? null,
-      stderr: error instanceof Error && error.stack ? error.stack : null
-    };
-    if (options.json) {
-      outputResult(envelope, true);
-    } else {
-      outputResult(
-        `Gemini companion failed: ${envelope.message}\n\n${JSON.stringify(envelope, null, 2)}`,
-        false
-      );
-    }
-    process.exitCode = 1;
-    return { exitStatus: 1, payload: envelope, rendered: envelope.message };
-  }
-  outputResult(options.json ? execution.payload : execution.rendered, options.json);
-  if (execution.exitStatus !== 0) {
-    process.exitCode = execution.exitStatus;
-  }
-  return execution;
-}
-
-function spawnDetachedTaskWorker(cwd, jobId) {
-  const scriptPath = path.join(ROOT_DIR, "scripts", "gemini-companion.mjs");
-  const child = spawn(
-    process.execPath,
-    [scriptPath, "task-worker", "--cwd", cwd, "--job-id", jobId],
-    {
-      cwd,
-      env: process.env,
-      detached: true,
-      stdio: "ignore",
-      windowsHide: true
-    }
-  );
-  child.unref();
-  return child;
-}
-
-function enqueueBackgroundTask(cwd, job, request) {
-  const { logFile } = createTrackedProgress(job);
-  appendLogLine(logFile, "Queued for background execution.");
-
-  const child = spawnDetachedTaskWorker(cwd, job.id);
-  const queuedRecord = {
-    ...job,
-    status: "queued",
-    phase: "queued",
-    pid: child.pid ?? null,
-    logFile,
-    request
-  };
-  writeJobFile(job.workspaceRoot, job.id, queuedRecord);
-  upsertJob(job.workspaceRoot, queuedRecord);
-
-  return {
-    payload: {
-      jobId: job.id,
-      status: "queued",
-      title: job.title,
-      summary: job.summary,
-      logFile
-    },
-    logFile
-  };
-}
-
-async function handleReviewCommand(argv, config) {
-  const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["base", "scope", "model", "cwd"],
-    booleanOptions: ["json", "background", "wait"],
-    aliasMap: { m: "model" }
-  });
-
-  const cwd = resolveCommandCwd(options);
-  const workspaceRoot = resolveCommandWorkspace(options);
-  const focusText = positionals.join(" ").trim();
-  const target = resolveReviewTarget(cwd, {
-    base: options.base,
-    scope: options.scope
-  });
-
-  const metadata = buildReviewJobMetadata(config.reviewName, target);
-  const job = createCompanionJob({
-    prefix: "review",
-    kind: metadata.kind,
-    title: metadata.title,
-    workspaceRoot,
-    jobClass: "review",
-    summary: metadata.summary
-  });
-  await runForegroundCommand(
-    job,
-    (progress) =>
-      executeReviewRun({
-        cwd,
-        base: options.base,
-        scope: options.scope,
-        model: normalizeRequestedModel(options.model),
-        focusText,
-        reviewName: config.reviewName,
-        onProgress: progress
-      }),
-    { json: options.json }
-  );
-}
-
-async function handleReview(argv) {
-  return handleReviewCommand(argv, { reviewName: "Review" });
-}
-
-async function handleTask(argv) {
-  const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["model", "effort", "cwd", "prompt-file"],
-    booleanOptions: [
-      "json",
-      "write",
-      "plan",
-      "resume-last",
-      "resume",
-      "fresh",
-      "background"
-    ],
-    aliasMap: { m: "model" }
-  });
-
-  const cwd = resolveCommandCwd(options);
-  const workspaceRoot = resolveCommandWorkspace(options);
-  const model = normalizeRequestedModel(options.model);
-  const effort = normalizeReasoningEffort(options.effort);
-  if (effort) {
-    process.stderr.write(
-      `[gemini] --effort ${effort} accepted but has no effect yet (Gemini ACP does not expose thinkingLevel control).\n`
-    );
-  }
-  const prompt = readTaskPrompt(cwd, options, positionals);
-
-  const resumeLast = Boolean(options["resume-last"] || options.resume);
-  const fresh = Boolean(options.fresh);
-  if (resumeLast && fresh) {
-    throw new Error("Choose either --resume/--resume-last or --fresh.");
-  }
-  const plan = Boolean(options.plan);
-  const write = plan ? false : options.write !== false;
-  const taskMetadata = buildTaskRunMetadata({ prompt, resumeLast });
-
-  if (options.background) {
-    ensureGeminiAvailable(cwd);
-    requireTaskRequest(prompt, resumeLast);
-
-    const job = buildTaskJob(workspaceRoot, taskMetadata, write);
-    const request = buildTaskRequest({
-      cwd,
-      model,
-      effort,
-      prompt,
-      write,
-      plan,
-      resumeLast,
-      jobId: job.id
-    });
-    const { payload } = enqueueBackgroundTask(cwd, job, request);
-    outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
-    return;
-  }
-
-  const job = buildTaskJob(workspaceRoot, taskMetadata, write);
-  await runForegroundCommand(
-    job,
-    (progress) =>
-      executeTaskRun({
-        cwd,
-        model,
-        effort,
-        prompt,
-        write,
-        plan,
-        resumeLast,
-        jobId: job.id,
-        onProgress: progress
-      }),
-    { json: options.json }
-  );
-}
-
-async function handleTaskWorker(argv) {
-  const { options } = parseCommandInput(argv, {
-    valueOptions: ["cwd", "job-id"]
-  });
-
-  if (!options["job-id"]) {
-    throw new Error("Missing required --job-id for task-worker.");
-  }
-
-  const cwd = resolveCommandCwd(options);
-  const workspaceRoot = resolveCommandWorkspace(options);
-  const storedJob = readStoredJob(workspaceRoot, options["job-id"]);
-  if (!storedJob) {
-    throw new Error(`No stored job found for ${options["job-id"]}.`);
-  }
-
-  const request = storedJob.request;
-  if (!request || typeof request !== "object") {
-    throw new Error(`Stored job ${options["job-id"]} is missing its task request payload.`);
-  }
-
-  const { logFile, progress } = createTrackedProgress(
-    {
-      ...storedJob,
-      workspaceRoot
-    },
-    { logFile: storedJob.logFile ?? null }
-  );
-  await runTrackedJob(
-    { ...storedJob, workspaceRoot, logFile },
-    () => executeTaskRun({ ...request, onProgress: progress }),
-    { logFile }
-  );
-  // Detached worker has stdio:ignore, no open refs visible to us, but
-  // lingering broker sockets / ACP child handles can keep the loop alive.
-  // The job is fully persisted by this point; force-exit to release the pid.
-  process.exit(0);
-}
-
 async function handleStatus(argv) {
-  const { options, positionals } = parseCommandInput(argv, {
+  const { options, positionals } = parseFlagCommand(argv, {
     valueOptions: ["cwd", "timeout-ms", "poll-interval-ms"],
     booleanOptions: ["json", "all", "wait"]
   });
@@ -842,7 +795,7 @@ async function handleStatus(argv) {
   }
 
   if (options.wait) {
-    const { job } = resolveWaitTargetJob(cwd, { all: options.all });
+    const { job } = resolveWaitTargetJob(cwd);
     const snapshot = await waitForSingleJobSnapshot(cwd, job.id, {
       timeoutMs: options["timeout-ms"],
       pollIntervalMs: options["poll-interval-ms"]
@@ -852,11 +805,11 @@ async function handleStatus(argv) {
   }
 
   const report = buildStatusSnapshot(cwd, { all: options.all });
-  outputResult(renderStatusPayload(report, options.json), options.json);
+  outputResult(options.json ? report : renderStatusReport(report), options.json);
 }
 
 function handleResult(argv) {
-  const { options, positionals } = parseCommandInput(argv, {
+  const { options, positionals } = parseFlagCommand(argv, {
     valueOptions: ["cwd"],
     booleanOptions: ["json"]
   });
@@ -865,104 +818,78 @@ function handleResult(argv) {
   const reference = positionals[0] ?? "";
   const { workspaceRoot, job } = resolveResultJob(cwd, reference);
   const storedJob = readStoredJob(workspaceRoot, job.id);
-  const payload = { job, storedJob };
 
-  outputCommandResult(payload, renderStoredJobResult(job, storedJob), options.json);
+  // A replay always exits 0 (the footer carries the job's own status) so the
+  // inline `!` command in /gemini:result never fails on a review with findings.
+  outputCommandResult({ job, storedJob }, renderStoredJobResult(job, storedJob), options.json);
 }
 
-function handleTaskResumeCandidate(argv) {
-  const { options } = parseCommandInput(argv, {
-    valueOptions: ["cwd"],
+async function handleWait(argv) {
+  const { options, positionals } = parseFlagCommand(argv, {
+    valueOptions: ["cwd", "timeout-ms", "poll-interval-ms"],
     booleanOptions: ["json"]
   });
 
   const cwd = resolveCommandCwd(options);
-  const workspaceRoot = resolveCommandWorkspace(options);
-  const sessionId = getCurrentClaudeSessionId();
-  const jobs = filterJobsForCurrentClaudeSession(sortJobsNewestFirst(listJobs(workspaceRoot)));
-  const candidate = findLatestResumableTaskJob(jobs);
+  const reference = positionals[0] || resolveWaitTargetJob(cwd).job.id;
+  const snapshot = await waitForSingleJobSnapshot(cwd, reference, {
+    timeoutMs: options["timeout-ms"],
+    pollIntervalMs: options["poll-interval-ms"]
+  });
 
-  const payload = {
-    available: Boolean(candidate),
-    sessionId,
-    candidate:
-      candidate == null
-        ? null
-        : {
-            id: candidate.id,
-            status: candidate.status,
-            title: candidate.title ?? null,
-            summary: candidate.summary ?? null,
-            threadId: candidate.threadId,
-            completedAt: candidate.completedAt ?? null,
-            updatedAt: candidate.updatedAt ?? null
-          }
-  };
+  if (snapshot.waitTimedOut) {
+    outputCommandResult(snapshot, `Job ${snapshot.job.handle ?? snapshot.job.id} is still ${snapshot.job.status} after ${Math.round(snapshot.timeoutMs / 1000)}s. Check /gemini:status.\n`, options.json);
+    process.exitCode = EXIT_FAILURE;
+    return;
+  }
 
-  const rendered = candidate
-    ? `Resumable task found: ${candidate.id} (${candidate.status}).\n`
-    : "No resumable task found for this session.\n";
-  outputCommandResult(payload, rendered, options.json);
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const storedJob = readStoredJob(workspaceRoot, snapshot.job.id);
+  outputCommandResult({ job: snapshot.job, storedJob }, renderStoredJobResult(snapshot.job, storedJob), options.json);
+  const exitStatus = Number.isInteger(storedJob?.exitStatus) ? storedJob.exitStatus : 0;
+  if (exitStatus !== 0) {
+    process.exitCode = exitStatus;
+  }
 }
 
 async function handleCancel(argv) {
-  const { options, positionals } = parseCommandInput(argv, {
+  const { options, positionals } = parseFlagCommand(argv, {
     valueOptions: ["cwd"],
     booleanOptions: ["json"]
   });
 
   const cwd = resolveCommandCwd(options);
   const reference = positionals[0] ?? "";
-  const { workspaceRoot, job } = resolveCancelableJob(cwd, reference, { env: process.env });
-  const existing = readStoredJob(workspaceRoot, job.id) ?? {};
-  const sessionId = existing.threadId ?? job.threadId ?? null;
+  const { workspaceRoot, job } = resolveCancelableJob(cwd, reference);
 
-  const interrupt = await interruptAcpTurn(cwd, { sessionId });
-  if (interrupt.attempted) {
-    appendLogLine(
-      job.logFile,
-      interrupt.interrupted
-        ? `Requested Gemini session cancel for ${sessionId}.`
-        : `Gemini session cancel failed${interrupt.detail ? `: ${interrupt.detail}` : "."}`
-    );
+  // The marker is written before any signal, so the run unwinding afterwards
+  // reads as cancelled. A job that finishes at the same moment also reads as
+  // cancelled; its stored result stays available to /gemini:result.
+  markJobCancelled(workspaceRoot, job.id);
+
+  // Signal the companion (its SIGTERM handler aborts the agy run), then stop
+  // the recorded agy process group directly with escalation, because the
+  // companion may already be dead and unable to escalate. A companion whose
+  // heartbeat went quiet is not signalled: its pid may now belong to another
+  // process.
+  const companionFresh = job.pid != null && Date.now() - Date.parse(job.heartbeatAt ?? "") <= 30_000;
+  const companionKill = companionFresh ? terminateProcessTree(job.pid) : { attempted: false, delivered: false };
+  let agyKill = { attempted: false, delivered: false };
+  if (job.agyPid != null && job.agyPid !== job.pid) {
+    agyKill = await stopProcessGroup(job.agyPid);
   }
-
-  terminateProcessTree(job.pid ?? Number.NaN);
   appendLogLine(job.logFile, "Cancelled by user.");
-
-  const completedAt = nowIso();
-  const nextJob = {
-    ...job,
-    status: "cancelled",
-    phase: "cancelled",
-    pid: null,
-    completedAt,
-    errorMessage: "Cancelled by user."
-  };
-
-  writeJobFile(workspaceRoot, job.id, {
-    ...existing,
-    ...nextJob,
-    cancelledAt: completedAt
-  });
-  upsertJob(workspaceRoot, {
-    id: job.id,
-    status: "cancelled",
-    phase: "cancelled",
-    pid: null,
-    errorMessage: "Cancelled by user.",
-    completedAt
-  });
 
   const payload = {
     jobId: job.id,
+    handle: job.handle ?? null,
     status: "cancelled",
     title: job.title,
-    turnInterruptAttempted: interrupt.attempted,
-    turnInterrupted: interrupt.interrupted
+    companionSignalled: companionKill.delivered,
+    agySignalled: agyKill.delivered
   };
 
-  outputCommandResult(payload, renderCancelReport(nextJob), options.json);
+  outputCommandResult(payload, renderCancelReport(job, { interrupted: companionKill.delivered || agyKill.delivered }), options.json);
 }
 
 async function main() {
@@ -977,16 +904,16 @@ async function main() {
       await handleSetup(argv);
       break;
     case "review":
-      await handleReview(argv);
+      await handleReviewCommand(argv, { reviewName: "Review" });
       break;
     case "adversarial-review":
       await handleReviewCommand(argv, { reviewName: "Adversarial Review" });
       break;
     case "task":
-      await handleTask(argv);
+      await handleTaskLike(argv);
       break;
-    case "task-worker":
-      await handleTaskWorker(argv);
+    case "reply":
+      await handleTaskLike(argv, { reply: true });
       break;
     case "status":
       await handleStatus(argv);
@@ -994,19 +921,19 @@ async function main() {
     case "result":
       handleResult(argv);
       break;
-    case "task-resume-candidate":
-      handleTaskResumeCandidate(argv);
+    case "wait":
+      await handleWait(argv);
       break;
     case "cancel":
       await handleCancel(argv);
       break;
     default:
-      throw new Error(`Unknown subcommand: ${subcommand}`);
+      throw new UsageError(`Unknown subcommand: ${subcommand}`);
   }
 }
 
 main().catch((error) => {
   const message = error instanceof Error ? error.message : String(error);
   process.stderr.write(`${message}\n`);
-  process.exitCode = 1;
+  process.exitCode = error instanceof UsageError ? EXIT_USAGE : EXIT_FAILURE;
 });
