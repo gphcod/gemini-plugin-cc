@@ -16,9 +16,6 @@ Thumbs.db
 coverage/
 .nyc_output/
 
-# Build
-*.tsbuildinfo
-
 # Logs
 *.log
 npm-debug.log*

@@ -4,6 +4,10 @@
 // conversation id for resume, and (with --json-schema) a validated
 // `structured_output` object. Ported from the dual-hosts gemini-bridge design.
 //
+// tests/agy-contract.live.test.mjs (`npm run test:live`) pins every agy
+// behaviour relied on here; re-run it after each agy upgrade and keep
+// tests/fixtures/fake-agy.mjs in step with it.
+//
 // Verified against agy 1.4.12: `--mode plan` is read-only for one-shot runs
 // but is ignored when `--disable-slash-commands` is set, so plan runs leave
 // slash expansion enabled while write runs disable it. When its own

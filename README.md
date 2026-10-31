@@ -1,7 +1,5 @@
 # Gemini plugin for Claude Code
 
-![Gemini plugin onboarding terminal loop](docs/assets/gemini-plugin-cc-onboarding.gif)
-
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-blue.svg)](LICENSE)
 [![Node](https://img.shields.io/badge/node-%3E%3D22-blue.svg)](package.json)
 [![Tests](https://img.shields.io/badge/tests-npm-green.svg)](tests/)
@@ -123,7 +121,27 @@ The companion writes the task to `agy`'s stdin, never to its argument list, so p
 
 ## Development
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) and [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
+Only `plugins/gemini/` is installed; the rest of the repository is the marketplace manifest and tests. No dependencies are needed.
+
+```bash
+npm test
+```
+
+`npm test` runs the offline suite against a fake `agy` (`tests/fixtures/fake-agy.mjs`). It also fails if the command files drift from `scripts/generate-commands.mjs`, if `SKILL.md` exceeds 3,000 B or a command exceeds 1,000 B, or if the version differs between `package.json`, `plugins/gemini/.claude-plugin/plugin.json` and `.claude-plugin/marketplace.json`.
+
+```bash
+npm run test:live
+```
+
+`npm run test:live` checks the `agy` behaviour the plugin relies on against the real CLI. It needs a signed-in `agy` and makes a few small paid calls. Run it after every `agy` upgrade.
+
+```bash
+npm run generate-commands
+```
+
+Command files are generated: edit `scripts/generate-commands.mjs`, then run `npm run generate-commands`.
+
+`/reload-plugins` does not discover new command or skill files, so start a new Claude Code session after adding one. A command whose frontmatter names a deferred tool (such as `Monitor`) is dropped without an error.
 
 ## Attribution
 

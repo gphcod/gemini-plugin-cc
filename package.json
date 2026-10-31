@@ -9,10 +9,7 @@
     "node": ">=22"
   },
   "scripts": {
-    "bump-version": "node scripts/bump-version.mjs",
-    "check-version": "node scripts/bump-version.mjs --check",
     "generate-commands": "node scripts/generate-commands.mjs",
-    "measure": "node scripts/measure.mjs",
     "test": "node --test tests/*.test.mjs",
     "test:live": "AGY_E2E=1 node --test --test-concurrency=1 tests/agy-contract.live.test.mjs"
   }

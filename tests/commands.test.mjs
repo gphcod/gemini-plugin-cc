@@ -60,6 +60,16 @@ test("model-visible surface stays within the token budget", () => {
   assert.equal(fs.existsSync(path.join(PLUGIN_ROOT, "agents")), false);
 });
 
+test("the version is the same in package.json, plugin.json and the marketplace", () => {
+  const readJson = (relative) => JSON.parse(fs.readFileSync(path.join(ROOT, relative), "utf8"));
+  const version = readJson("package.json").version;
+  const marketplace = readJson(".claude-plugin/marketplace.json");
+  assert.match(version, /^\d+\.\d+\.\d+$/);
+  assert.equal(readJson("plugins/gemini/.claude-plugin/plugin.json").version, version);
+  assert.equal(marketplace.metadata.version, version);
+  assert.equal(marketplace.plugins.find((plugin) => plugin.name === "gemini").version, version);
+});
+
 test("the only hook is the optional Stop review gate", () => {
   const hooks = JSON.parse(read("hooks/hooks.json")).hooks;
   assert.deepEqual(Object.keys(hooks), ["Stop"]);
@@ -84,7 +94,7 @@ test("no plugin file still refers to the retired Gemini CLI or ACP runtime", () 
   const stale = /\bACP\b|acp-client|@google\/gemini-cli|codebase_investigator|--resume-last|gemini --resume|session\/prompt/;
   const walk = (dir) => fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) =>
     entry.isDirectory() ? walk(path.join(dir, entry.name)) : [path.join(dir, entry.name)]);
-  for (const file of walk(PLUGIN_ROOT).filter((name) => /\.(md|mjs|json)$/.test(name) && !name.endsWith("CHANGELOG.md"))) {
+  for (const file of walk(PLUGIN_ROOT).filter((name) => /\.(md|mjs|json)$/.test(name))) {
     assert.doesNotMatch(fs.readFileSync(file, "utf8"), stale, path.relative(PLUGIN_ROOT, file));
   }
 });

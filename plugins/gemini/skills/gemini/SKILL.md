@@ -34,7 +34,6 @@ Briefs:
 - Give a real brief: goal, files to read (paths, not pasted contents), what done looks like, what evidence to return. Not a one-liner.
 - Follow-ups go through `reply` with only the new instruction and changed facts.
 - For a task that may edit, capture `git status` first and inspect the diff after; verify claims you rely on instead of redoing the work.
-- Templates: `references/prompt-recipes.md`; blocks and anti-patterns sit beside it. Read only for a hard brief.
 
 Results:
 - Summarize; never repeat the answer verbatim. Keep file:line references exact and keep Gemini's inferences labelled as inferences.
