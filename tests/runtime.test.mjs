@@ -8,6 +8,7 @@ import { spawn } from "node:child_process";
 import {
   COMPANION,
   isAlive,
+  isReadOnlyLaunch,
   makeFakeAgyWorkspace,
   readArgvLog,
   runCompanion,
@@ -79,13 +80,24 @@ test("task prints the answer and one compact footer, with the start line on stde
   assert.match(footer(result.stdout), /^gemini ok · job [0-9a-z]{4} · \d+s$/);
 });
 
+test("the job log names each tool call and why a failed one failed", () => {
+  const ws = makeFakeAgyWorkspace();
+  const result = runCompanion(["task", "read", "things"], { cwd: ws.repo, env: ws.env, scenario: "recovered-tool-error" });
+  assert.equal(result.status, 0, result.stderr);
+  const jobsDir = path.join(ws.data, "state", fs.readdirSync(path.join(ws.data, "state"))[0], "jobs");
+  const log = fs.readFileSync(path.join(jobsDir, fs.readdirSync(jobsDir).find((name) => name.endsWith(".log"))), "utf8");
+  assert.match(log, /tool: read_file \/repo\/tests\/missing\.test\.mjs/);
+  assert.match(log, /failed: read_file \/repo\/tests\/missing\.test\.mjs — file does not exist/);
+});
+
 test("task sends write mode with the sandbox by default and plan mode with --plan", () => {
   const ws = makeFakeAgyWorkspace();
   runCompanion(["task", "fix", "it"], { cwd: ws.repo, env: ws.env });
   runCompanion(["task", "--plan", "look", "only"], { cwd: ws.repo, env: ws.env });
   const [write, plan] = readArgvLog(ws.argvLog);
   assert.ok(write.includes("accept-edits") && write.includes("--sandbox") && write.includes("--disable-slash-commands"));
-  assert.ok(plan.includes("plan") && !plan.includes("--sandbox") && !plan.includes("--disable-slash-commands"));
+  assert.ok(!isReadOnlyLaunch(write));
+  assert.ok(isReadOnlyLaunch(plan) && plan.includes("--disable-slash-commands"));
 });
 
 test("prompt text keeps quotes and embedded flags when passed as one raw argument", () => {
@@ -96,7 +108,7 @@ test("prompt text keeps quotes and embedded flags when passed as one raw argumen
   const echoed = JSON.parse(result.stdout.split("\n")[0]);
   const content = JSON.parse(echoed.input).message.content;
   assert.equal(content, `explain why "--model" and 'it\\'s' --json appear here`);
-  assert.ok(echoed.args.includes("plan"));
+  assert.ok(isReadOnlyLaunch(echoed.args));
 });
 
 test("task reads the prompt from stdin when no text is given", () => {
@@ -152,7 +164,7 @@ test("review with findings exits 10 and renders them by severity", () => {
   assert.match(result.stdout, /- \[high\] Example finding \(src\/example\.mjs:10-12\)/);
   assert.match(footer(result.stdout), /^gemini ok · job [0-9a-z]{4}/);
   const args = readArgvLog(ws.argvLog)[0];
-  assert.ok(args.includes("plan"));
+  assert.ok(isReadOnlyLaunch(args));
   assert.ok(args[args.indexOf("--json-schema") + 1].endsWith("review-output.schema.json"));
 });
 
@@ -334,4 +346,20 @@ test("a job whose process died shows as stalled instead of running forever", () 
   write(5 * 60_000);
   const settled = runCompanion(["status"], { cwd: ws.repo, env: ws.env });
   assert.match(settled.stdout, /\| failed \|/);
+});
+
+test("setup --verify measures agy's context per call", () => {
+  const ws = makeFakeAgyWorkspace();
+  const result = runCompanion(["setup", "--verify"], { cwd: ws.repo, env: ws.env });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /live check passed/);
+  assert.match(result.stdout, /agy context per call: \d+ input tokens and \d+ tools offered/);
+  assert.ok(isReadOnlyLaunch(readArgvLog(ws.argvLog)[0]), "the measuring turn is read-only");
+});
+
+test("the retired wait subcommand is gone and reports a usage error", () => {
+  const ws = makeFakeAgyWorkspace();
+  const result = runCompanion(["wait"], { cwd: ws.repo, env: ws.env });
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /Unknown subcommand: wait/);
 });

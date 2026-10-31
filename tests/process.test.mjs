@@ -93,3 +93,15 @@ test("terminateProcessTree treats missing Windows processes as already stopped",
   assert.equal(outcome.result.status, 128);
   assert.match(outcome.result.stdout, /not found/i);
 });
+
+test("runCommand passes shell metacharacters literally because no shell is involved", () => {
+  const tricky = 'a; echo pwned | cat > /tmp/never && $(whoami) `id` "q" \'s\'';
+  const result = runCommand(process.execPath, ["-e", "process.stdout.write(process.argv[1])", tricky]);
+  assert.equal(result.status, 0);
+  assert.equal(result.stdout, tricky);
+});
+
+test("a missing executable is reported as ENOENT, not a shell error", () => {
+  const result = runCommand("definitely-not-a-command-xyz", ["--version"]);
+  assert.equal(result.error?.code, "ENOENT");
+});

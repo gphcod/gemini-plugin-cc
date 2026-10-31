@@ -32,6 +32,7 @@ Output: the answer, then one footer `gemini ok · job k3f9 · 41s`. Past 24 KiB 
 
 Briefs:
 - Give a real brief: goal, files to read (paths, not pasted contents), what done looks like, what evidence to return. Not a one-liner.
+- Name exact files: agy cannot expand globs such as `tests/*.mjs` and guesses names instead. List the files, or name the directory.
 - Follow-ups go through `reply` with only the new instruction and changed facts.
 - For a task that may edit, capture `git status` first and inspect the diff after; verify claims you rely on instead of redoing the work.
 

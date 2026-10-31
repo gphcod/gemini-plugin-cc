@@ -159,3 +159,28 @@ test("records are written atomically with no temp files left behind", () => {
   assert.deepEqual(fs.readdirSync(resolveJobsDir(workspace)).filter((name) => name.endsWith(".tmp")), []);
   assert.equal(listJobs(workspace)[0].status, "running");
 });
+
+test("review diff files are written privately and pruned with their job", async () => {
+  const { writeJobDiff } = await import("../plugins/gemini/scripts/lib/state.mjs");
+  const workspace = makeTempDir();
+  writeJobRecord(workspace, { id: "review-old", status: "completed" });
+  const diffFile = writeJobDiff(workspace, "review-old", "diff --git a b\n");
+  assert.equal(fs.statSync(diffFile).mode & 0o777, 0o600);
+  pruneFinishedJobs(workspace, 0);
+  assert.equal(fs.existsSync(diffFile), false);
+});
+
+test("the gate baseline round-trips and is absent at first", async () => {
+  const { readGateBaseline, writeGateBaseline } = await import("../plugins/gemini/scripts/lib/state.mjs");
+  const workspace = makeTempDir();
+  assert.equal(readGateBaseline(workspace), null);
+  writeGateBaseline(workspace, { head: "abc", digest: "d1" });
+  assert.deepEqual(readGateBaseline(workspace), { head: "abc", digest: "d1" });
+});
+
+test("state directories are resolved once per directory and plugin data root", () => {
+  const workspace = makeTempDir();
+  const first = withPluginData(makeTempDir(), () => resolveStateDir(workspace));
+  const second = withPluginData(makeTempDir(), () => resolveStateDir(workspace));
+  assert.notEqual(first, second, "a different plugin data root gets its own directory");
+});

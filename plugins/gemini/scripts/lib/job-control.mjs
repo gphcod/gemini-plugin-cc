@@ -1,14 +1,11 @@
 import fs from "node:fs";
 
-import { deriveJobState, getConfig, listJobs, readJobResult, resolveJobFile } from "./state.mjs";
+import { formatDuration } from "./render.mjs";
+import { deriveJobState, getConfig, isActiveJobStatus, listJobs, readJobResult, resolveJobFile } from "./state.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 export const DEFAULT_MAX_STATUS_JOBS = 10;
 export const DEFAULT_MAX_PROGRESS_LINES = 4;
-
-export function sortJobsNewestFirst(jobs) {
-  return [...jobs].sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")));
-}
 
 function getJobTypeLabel(job) {
   if (typeof job.kindLabel === "string" && job.kindLabel) {
@@ -53,32 +50,14 @@ export function readJobProgressPreview(logFile, maxLines = DEFAULT_MAX_PROGRESS_
 
 function formatElapsedDuration(startValue, endValue = null) {
   const start = Date.parse(startValue ?? "");
-  if (!Number.isFinite(start)) {
-    return null;
-  }
-
   const end = endValue ? Date.parse(endValue) : Date.now();
-  if (!Number.isFinite(end) || end < start) {
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) {
     return null;
   }
-
-  const totalSeconds = Math.max(0, Math.round((end - start) / 1000));
-  const hours = Math.floor(totalSeconds / 3600);
-  const minutes = Math.floor((totalSeconds % 3600) / 60);
-  const seconds = totalSeconds % 60;
-
-  if (hours > 0) {
-    return `${hours}h ${minutes}m`;
-  }
-  if (minutes > 0) {
-    return `${minutes}m ${seconds}s`;
-  }
-  return `${seconds}s`;
+  return formatDuration((end - start) / 1000);
 }
 
-export function isActiveJobStatus(status) {
-  return status === "queued" || status === "running";
-}
+export { isActiveJobStatus };
 
 // listJobs() derives `stalled`: the job claims to be active but its companion
 // is gone, e.g. a foreground run whose Bash call hit its timeout.
@@ -154,7 +133,7 @@ export function matchJobReference(jobs, reference, predicate = () => true) {
 export function buildStatusSnapshot(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const config = getConfig(workspaceRoot);
-  const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
+  const jobs = listJobs(workspaceRoot);
   const maxJobs = options.maxJobs ?? DEFAULT_MAX_STATUS_JOBS;
   const maxProgressLines = options.maxProgressLines ?? DEFAULT_MAX_PROGRESS_LINES;
 
@@ -181,7 +160,7 @@ export function buildStatusSnapshot(cwd, options = {}) {
 
 export function buildSingleJobSnapshot(cwd, reference, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
+  const jobs = listJobs(workspaceRoot);
   const selected = matchJobReference(jobs, reference);
   if (!selected) {
     throw new Error(`No job found for "${reference}". Run /gemini:status to inspect known jobs.`);
@@ -195,7 +174,7 @@ export function buildSingleJobSnapshot(cwd, reference, options = {}) {
 
 export function resolveResultJob(cwd, reference) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
+  const jobs = listJobs(workspaceRoot);
 
   if (!reference) {
     const latestFinished = jobs.find(
@@ -217,7 +196,7 @@ export function resolveResultJob(cwd, reference) {
 
 export function resolveCancelableJob(cwd, reference) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
+  const jobs = listJobs(workspaceRoot);
   const activeJobs = jobs.filter((job) => isActiveJobStatus(job.status));
 
   if (reference) {
@@ -236,19 +215,4 @@ export function resolveCancelableJob(cwd, reference) {
   }
 
   throw new Error("No active Gemini jobs to cancel.");
-}
-
-export function resolveWaitTargetJob(cwd) {
-  const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
-  const activeJobs = jobs.filter((job) => isActiveJobStatus(job.status) && !isJobStalled(job));
-
-  if (activeJobs.length === 1) {
-    return { workspaceRoot, job: activeJobs[0] };
-  }
-  if (activeJobs.length > 1) {
-    throw new Error("Multiple Gemini jobs are active. Pass a job handle to wait on.");
-  }
-
-  throw new Error("No active Gemini jobs to wait on.");
 }

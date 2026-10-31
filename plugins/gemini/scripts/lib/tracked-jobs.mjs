@@ -2,6 +2,7 @@ import fs from "node:fs";
 import process from "node:process";
 
 import {
+  nowIso,
   patchJobRecord,
   pruneFinishedJobs,
   readCancelMarker,
@@ -9,10 +10,6 @@ import {
   writeJobRecord,
   writeJobResult
 } from "./state.mjs";
-
-export function nowIso() {
-  return new Date().toISOString();
-}
 
 function normalizeProgressEvent(value) {
   if (value && typeof value === "object" && !Array.isArray(value)) {

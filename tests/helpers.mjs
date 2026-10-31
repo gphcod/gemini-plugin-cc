@@ -10,6 +10,14 @@ export const PLUGIN_ROOT = path.join(ROOT, "plugins", "gemini");
 export const COMPANION = path.join(PLUGIN_ROOT, "scripts", "gemini-companion.mjs");
 export const FAKE_AGY = path.join(ROOT, "tests", "fixtures", "fake-agy.mjs");
 
+// A read-only agy launch: deny-all settings plus the sandbox.
+export function isReadOnlyLaunch(args) {
+  const index = args.indexOf("--settings");
+  if (index === -1 || !args.includes("--sandbox")) return false;
+  const deny = JSON.parse(args[index + 1]).permissions?.deny ?? [];
+  return ["write_file(*)", "edit_file(*)", "command(*)", "mcp(*)"].every((rule) => deny.includes(rule));
+}
+
 export function makeTempDir(prefix = "gemini-plugin-test-") {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }

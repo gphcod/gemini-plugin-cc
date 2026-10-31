@@ -60,7 +60,10 @@ if (scenario === "echo") {
 } else if (scenario === "malformed-result") {
   result.response = null;
 } else if (scenario === "recovered-tool-error") {
-  emit({ event: "step_update", step_update: { conversation_id: CONVERSATION_ID, step_index: 2, state: "ERROR", step_type: "tool", error: "Transient read failure; retried" } });
+  // Shape captured from agy 1.4.12 for a read of a missing file.
+  const toolInfo = { name: "read_file", parameters: { Path: "/repo/tests/missing.test.mjs" } };
+  emit({ event: "step_update", step_update: { conversation_id: CONVERSATION_ID, step_index: 2, state: "ACTIVE", step_type: "tool", tool_name: "read_file", tool_info: toolInfo } });
+  emit({ event: "step_update", step_update: { conversation_id: CONVERSATION_ID, step_index: 2, state: "ERROR", step_type: "tool", tool_name: "read_file", duration_seconds: 0.05, tool_info: { ...toolInfo, error: { type: "TOOL_ERROR", message: "file does not exist" } } } });
 } else if (scenario === "review") {
   result.structured_output = {
     verdict: "needs-attention",

@@ -3,12 +3,15 @@ import assert from "node:assert/strict";
 import process from "node:process";
 import { spawn } from "node:child_process";
 
-import { FAKE_AGY, isAlive, waitFor } from "./helpers.mjs";
+import { FAKE_AGY, isAlive, isReadOnlyLaunch, waitFor } from "./helpers.mjs";
 import {
   AGY_INSTALL_HINT,
   buildLaunchDescription,
   DEFAULT_TIMEOUT_SECONDS,
+  describeStepError,
+  describeToolStep,
   isDeniedFailure,
+  READ_ONLY_SETTINGS,
   resultFailure,
   runAgy
 } from "../plugins/gemini/scripts/lib/agy.mjs";
@@ -35,17 +38,17 @@ test("write runs disable slash commands and use accept-edits with the default ti
   assert.equal(launch.input, `${JSON.stringify({ event: "user", message: { content: "fix it" } })}\n`);
 });
 
-test("plan runs keep slash expansion so agy honours read-only mode", () => {
-  const launch = buildLaunchDescription({ task: "look", mode: "plan" });
-  assert.ok(launch.args.includes("plan"));
-  assert.ok(!launch.args.includes("--disable-slash-commands"));
+test("read-only runs deny every write, edit, command and MCP call and add the sandbox", () => {
+  const launch = buildLaunchDescription({ task: "look", readOnly: true });
+  assert.ok(isReadOnlyLaunch(launch.args));
+  assert.equal(launch.args[launch.args.indexOf("--settings") + 1], READ_ONLY_SETTINGS);
+  assert.ok(launch.args.includes("--disable-slash-commands"));
+  assert.ok(!launch.args.includes("plan"), "plan mode is not used");
 });
 
-test("a plan task starting with a slash is prefixed so it is not run as a slash command", () => {
-  const plan = buildLaunchDescription({ task: "/etc/hosts: what is this?", mode: "plan" });
-  assert.equal(JSON.parse(plan.input).message.content, "Task: /etc/hosts: what is this?");
-  const write = buildLaunchDescription({ task: "/etc/hosts: what is this?" });
-  assert.equal(JSON.parse(write.input).message.content, "/etc/hosts: what is this?");
+test("task text is passed through unchanged, even when it starts with a slash", () => {
+  const launch = buildLaunchDescription({ task: "/etc/hosts: what is this?", readOnly: true });
+  assert.equal(JSON.parse(launch.input).message.content, "/etc/hosts: what is this?");
 });
 
 test("model, effort, conversation, schema and sandbox pass through unchanged", () => {
@@ -124,6 +127,20 @@ test("denied actions are distinguishable for the exit-code contract", async () =
   const outcome = await runAgy({ task: "t" }, { spawnImpl: fakeSpawn("denied") });
   assert.equal(isDeniedFailure(outcome.result), true);
   assert.equal(isDeniedFailure({ denied_actions: [] }), false);
+});
+
+test("a failed tool step is described with its tool, target and agy's reason", () => {
+  // Shape captured from agy 1.4.12.
+  const failed = {
+    state: "ERROR",
+    step_type: "tool",
+    tool_name: "read_file",
+    tool_info: { name: "read_file", parameters: { Path: "/repo/tests/missing.test.mjs" }, error: { type: "TOOL_ERROR", message: "file does not exist" } }
+  };
+  assert.equal(describeStepError(failed), "failed: read_file /repo/tests/missing.test.mjs — file does not exist");
+  assert.equal(describeToolStep({ tool_name: "run_command", tool_info: { parameters: { Cwd: "/repo", CommandLine: "npm test" } } }), "run_command npm test");
+  assert.equal(describeToolStep({ tool_name: "search_web", tool_info: { parameters: { query: "agy flags" } } }), "search_web agy flags");
+  assert.equal(describeStepError({ state: "ERROR", step_type: "agent_response" }), "failed: agent_response — no reason given");
 });
 
 test("resultFailure accepts a complete successful result", () => {

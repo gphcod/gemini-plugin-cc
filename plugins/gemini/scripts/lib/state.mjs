@@ -28,11 +28,23 @@ const DEBRIS_QUIET_MS = 60_000;
 
 export { isPidAlive };
 
-function nowIso() {
+export function nowIso() {
   return new Date().toISOString();
 }
 
+// Every record, marker and heartbeat access resolves the state directory, so
+// it is computed once per (directory, plugin data root) pair.
+const stateDirs = new Map();
+const ensuredStateDirs = new Set();
+
 export function resolveStateDir(cwd) {
+  const pluginDataDir = process.env[PLUGIN_DATA_ENV] ?? "";
+  const key = `${path.resolve(cwd)}\0${pluginDataDir}`;
+  const cached = stateDirs.get(key);
+  if (cached) {
+    return cached;
+  }
+
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   let canonicalWorkspaceRoot = workspaceRoot;
   try {
@@ -44,9 +56,10 @@ export function resolveStateDir(cwd) {
   const slugSource = path.basename(workspaceRoot) || "workspace";
   const slug = slugSource.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "workspace";
   const hash = createHash("sha256").update(canonicalWorkspaceRoot).digest("hex").slice(0, 16);
-  const pluginDataDir = process.env[PLUGIN_DATA_ENV];
   const stateRoot = pluginDataDir ? path.join(pluginDataDir, "state") : FALLBACK_STATE_ROOT_DIR;
-  return path.join(stateRoot, `${slug}-${hash}`);
+  const stateDir = path.join(stateRoot, `${slug}-${hash}`);
+  stateDirs.set(key, stateDir);
+  return stateDir;
 }
 
 export function resolveJobsDir(cwd) {
@@ -59,11 +72,15 @@ function resolveRequestsDir(cwd) {
 
 export function ensureStateDir(cwd) {
   const stateDir = resolveStateDir(cwd);
+  if (ensuredStateDirs.has(stateDir)) {
+    return;
+  }
   for (const dir of [resolveJobsDir(cwd), resolveRequestsDir(cwd)]) {
     fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
     try { fs.chmodSync(dir, 0o700); } catch {}
   }
   try { fs.chmodSync(stateDir, 0o700); } catch {}
+  ensuredStateDirs.add(stateDir);
 }
 
 // Readers never see a torn file: content goes to a temp file, then rename.
@@ -126,6 +143,25 @@ export function setConfig(cwd, key, value) {
   return next;
 }
 
+// The repository fingerprint at the last stop the gate allowed; written only
+// by the Stop hook.
+export function readGateBaseline(cwd) {
+  return readJsonOrNull(path.join(resolveStateDir(cwd), "gate-baseline.json"));
+}
+
+export function writeGateBaseline(cwd, baseline) {
+  ensureStateDir(cwd);
+  writeFileAtomic(path.join(resolveStateDir(cwd), "gate-baseline.json"), `${JSON.stringify(baseline)}\n`);
+}
+
+// A stop-gate diff too large to inline, attached as a file for Gemini to read.
+export function writeGateChanges(cwd, text) {
+  ensureStateDir(cwd);
+  const file = path.join(resolveStateDir(cwd), "gate-changes.diff");
+  writeFileAtomic(file, String(text ?? ""));
+  return file;
+}
+
 // --- job records ------------------------------------------------------------
 
 export function generateJobId(prefix = "job") {
@@ -173,6 +209,14 @@ export function writeAnswerFile(cwd, jobId, text) {
   return answerFile;
 }
 
+// A review diff too large to inline, handed to Gemini as a file to read.
+export function writeJobDiff(cwd, jobId, text) {
+  ensureStateDir(cwd);
+  const diffFile = path.join(resolveJobsDir(cwd), `${jobId}.diff`);
+  writeFileAtomic(diffFile, String(text ?? ""));
+  return diffFile;
+}
+
 // Owner only: the companion running the job is the record's sole writer.
 export function writeJobRecord(cwd, record) {
   ensureStateDir(cwd);
@@ -215,7 +259,7 @@ export function readCancelMarker(cwd, jobId) {
   return readJsonOrNull(resolveCancelMarker(cwd, jobId));
 }
 
-function isActiveStatus(status) {
+export function isActiveJobStatus(status) {
   return status === "queued" || status === "running";
 }
 
@@ -234,12 +278,12 @@ export function deriveJobState(record, cancel, now = Date.now()) {
       ...record,
       status: "cancelled",
       phase: "cancelled",
-      completedAt: record.completedAt && !isActiveStatus(record.status) ? record.completedAt : cancel.cancelledAt,
+      completedAt: record.completedAt && !isActiveJobStatus(record.status) ? record.completedAt : cancel.cancelledAt,
       errorMessage: record.errorMessage ?? "Cancelled by user.",
       stalled: false
     };
   }
-  if (!isActiveStatus(record.status)) {
+  if (!isActiveJobStatus(record.status)) {
     return { ...record, stalled: false };
   }
   const quietFor = now - lastSignOfLife(record);
@@ -271,12 +315,14 @@ export function listJobs(cwd) {
     return [];
   }
   const now = Date.now();
+  const present = new Set(names);
   const jobs = [];
   for (const name of names) {
     if (!name.endsWith(".json") || name.endsWith(".result.json")) continue;
     const record = readJsonOrNull(path.join(jobsDir, name));
     if (!record?.id) continue;
-    jobs.push(deriveJobState(record, readCancelMarker(cwd, record.id), now));
+    const cancel = present.has(`${record.id}.cancel`) ? readJsonOrNull(path.join(jobsDir, `${record.id}.cancel`)) : null;
+    jobs.push(deriveJobState(record, cancel, now));
   }
   return jobs.sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")));
 }
@@ -307,9 +353,9 @@ export function claimRequestId(cwd, requestId, jobId) {
 // another caller may be re-creating it, and each is under 100 bytes. A retry
 // whose job was pruned is told to use a new id.
 export function pruneFinishedJobs(cwd, maxFinished = MAX_FINISHED_JOBS) {
-  const finished = listJobs(cwd).filter((job) => !isActiveStatus(job.status));
+  const finished = listJobs(cwd).filter((job) => !isActiveJobStatus(job.status));
   for (const job of finished.slice(maxFinished)) {
-    for (const suffix of [".json", ".result.json", ".cancel", ".txt", ".log"]) {
+    for (const suffix of [".json", ".result.json", ".cancel", ".txt", ".log", ".diff"]) {
       removeFile(path.join(resolveJobsDir(cwd), `${job.id}${suffix}`));
     }
   }

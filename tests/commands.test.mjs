@@ -5,7 +5,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 
-import { makeFakeAgyWorkspace, PLUGIN_ROOT, readArgvLog, ROOT } from "./helpers.mjs";
+import { isReadOnlyLaunch, makeFakeAgyWorkspace, PLUGIN_ROOT, readArgvLog, ROOT } from "./helpers.mjs";
 import { COMMANDS, renderCommand } from "../scripts/generate-commands.mjs";
 
 function read(relativePath) {
@@ -129,7 +129,7 @@ test("rescue's call form forwards flags and text, and --resume continues the con
   const second = runClaudeForm(line, ws, { args: "--resume now check app.js", scenario: "echo" });
   assert.equal(second.status, 0, second.stderr);
   const [planArgs, resumeArgs] = readArgvLog(ws.argvLog);
-  assert.ok(planArgs.includes("plan"));
+  assert.ok(isReadOnlyLaunch(planArgs));
   assert.ok(resumeArgs.includes("--conversation"));
   assert.equal(JSON.parse(JSON.parse(second.stdout.split("\n")[0]).input).message.content, "now check app.js");
 });
@@ -156,5 +156,11 @@ test("the skill's heredoc form delivers a multi-line brief intact without using 
   assert.equal(result.status, 0, result.stderr);
   const echoed = JSON.parse(result.stdout.split("\n")[0]);
   assert.equal(JSON.parse(echoed.input).message.content, brief);
-  assert.ok(echoed.args.includes("plan"));
+  assert.ok(isReadOnlyLaunch(echoed.args));
+});
+
+test("the generator renders frontmatter in a fixed order and user-only flags only where set", () => {
+  const rendered = renderCommand({ name: "x", description: "D", argumentHint: "[a]", userOnly: true, allowedTools: "Bash(node:*)", body: "Body\n\n" });
+  assert.equal(rendered, "---\ndescription: D\nargument-hint: '[a]'\ndisable-model-invocation: true\nallowed-tools: Bash(node:*)\n---\n\nBody\n");
+  assert.doesNotMatch(renderCommand({ name: "y", description: "D", argumentHint: "", userOnly: false, allowedTools: "Bash(node:*)", body: "B" }), /disable-model-invocation/);
 });

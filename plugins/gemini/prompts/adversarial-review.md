@@ -32,7 +32,7 @@ Actively try to disprove the change.
 Look for violated invariants, missing guards, unhandled failure paths, and assumptions that stop being true under stress.
 Trace how bad inputs, retries, concurrent actions, or partially completed operations move through the code.
 If the user supplied a focus area, weight it heavily, but still report any other material issue you can defend.
-This is a read-only review: you may read files and run read-only git commands to trace call sites and invariants, but never modify the workspace.
+This is a read-only review: read files with read_file to trace call sites and invariants. Shell commands, edits and MCP tools are disabled for this run.
 {{REVIEW_COLLECTION_GUIDANCE}}
 </review_method>
 

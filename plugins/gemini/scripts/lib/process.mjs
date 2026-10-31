@@ -30,16 +30,19 @@ export function isProcessGroupAlive(pid, platform = process.platform) {
   }
 }
 
+// Never through a shell: git, taskkill and agy are native executables on every
+// platform, and a shell would re-parse arguments (Git Bash's MSYS layer
+// rewrites taskkill's /PID into a path, and cmd.exe splits on metacharacters).
 export function runCommand(command, args = [], options = {}) {
   const result = spawnSync(command, args, {
     cwd: options.cwd,
     env: options.env,
     encoding: "utf8",
     input: options.input,
-    maxBuffer: options.maxBuffer,
+    maxBuffer: options.maxBuffer ?? 64 * 1024 * 1024,
     timeout: options.timeout,
     stdio: options.stdio ?? "pipe",
-    shell: process.platform === "win32" ? (process.env.SHELL || true) : false,
+    shell: false,
     windowsHide: true
   });
 

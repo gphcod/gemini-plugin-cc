@@ -52,3 +52,13 @@ test("splitRawArgumentString and parseArgs keep their flag-command behaviour", (
   assert.deepEqual(splitRawArgumentString(`a "b c" 'd' e\\ f`), ["a", "b c", "d", "e f"]);
   assert.deepEqual(parseArgs(["--json", "job1"], { booleanOptions: ["json"] }), { options: { json: true }, positionals: ["job1"] });
 });
+
+test("backslashes stay literal inside single quotes, as in POSIX shells", () => {
+  const { options, text } = parseProseCommand([String.raw`--prompt-file 'C:\work\plan.md' --model "a\"b" go`], {
+    valueOptions: ["prompt-file", "model"]
+  });
+  assert.equal(options["prompt-file"], String.raw`C:\work\plan.md`);
+  assert.equal(options.model, 'a"b');
+  assert.equal(text, "go");
+  assert.deepEqual(splitRawArgumentString(String.raw`'a\b' "c\d" e\ f`), [String.raw`a\b`, "cd", "e f"]);
+});

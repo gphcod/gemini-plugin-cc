@@ -1,5 +1,20 @@
 const ANSWER_CAP_BYTES = 24 * 1024;
 
+export function shorten(text, limit = 96) {
+  const normalized = String(text ?? "").trim().replace(/\s+/g, " ");
+  if (normalized.length <= limit) return normalized;
+  return `${normalized.slice(0, limit - 3)}...`;
+}
+
+export function formatDuration(seconds) {
+  if (!Number.isFinite(seconds) || seconds < 0) return null;
+  const total = Math.round(seconds);
+  if (total < 60) return `${total}s`;
+  const minutes = Math.floor(total / 60);
+  if (minutes < 60) return `${minutes}m ${total % 60}s`;
+  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+}
+
 function severityRank(severity) {
   switch (severity) {
     case "critical":
@@ -90,6 +105,11 @@ export function renderSetupReport(report) {
     `- auth: ${report.auth.detail}`,
     `- review gate: ${report.reviewGateEnabled ? "enabled" : "disabled"}`
   ];
+  if (report.baseline?.ok) {
+    lines.push(
+      `- agy context per call: ${report.baseline.inputTokens ?? "?"} input tokens and ${report.baseline.toolCount ?? "?"} tools offered, measured with a one-line read-only turn`
+    );
+  }
 
   if (report.actionsTaken.length > 0) {
     lines.push("Actions taken:");

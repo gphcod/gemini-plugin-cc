@@ -10,10 +10,12 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
+import { agyCommand } from "./lib/agy.mjs";
+import { describeChangesSince, repoFingerprint } from "./lib/git.mjs";
 import { binaryAvailable } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
-import { getConfig, listJobs } from "./lib/state.mjs";
-import { isActiveJobStatus, isJobStalled, sortJobsNewestFirst } from "./lib/job-control.mjs";
+import { getConfig, isActiveJobStatus, listJobs, readGateBaseline, writeGateBaseline, writeGateChanges } from "./lib/state.mjs";
+import { isJobStalled } from "./lib/job-control.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
 // Inner budget stays well under the hook's 900 s timeout so the hook always
@@ -41,14 +43,15 @@ function logNote(message) {
   }
 }
 
-export function buildStopReviewPrompt(input = {}) {
+export function buildStopReviewPrompt(input = {}, repoChanges = "") {
   const lastAssistantMessage = String(input.last_assistant_message ?? "").trim();
   const template = loadPromptTemplate(ROOT_DIR, "stop-review-gate");
   const claudeResponseBlock = lastAssistantMessage
     ? ["Previous Claude response:", lastAssistantMessage].join("\n")
     : "";
   return interpolateTemplate(template, {
-    CLAUDE_RESPONSE_BLOCK: claudeResponseBlock
+    CLAUDE_RESPONSE_BLOCK: claudeResponseBlock,
+    REPO_CHANGES_BLOCK: repoChanges || "(not a Git repository: no change summary available)"
   });
 }
 
@@ -88,7 +91,7 @@ export function parseStopReviewOutput(rawOutput) {
   };
 }
 
-function runStopReview(cwd, input = {}) {
+function runStopReview(cwd, input = {}, repoChanges = "") {
   const scriptPath = path.join(SCRIPT_DIR, "gemini-companion.mjs");
   const result = spawnSync(
     process.execPath,
@@ -97,7 +100,7 @@ function runStopReview(cwd, input = {}) {
       cwd,
       env: process.env,
       encoding: "utf8",
-      input: buildStopReviewPrompt(input),
+      input: buildStopReviewPrompt(input, repoChanges),
       timeout: GATE_PROCESS_TIMEOUT_MS
     }
   );
@@ -139,7 +142,7 @@ async function main() {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const config = getConfig(workspaceRoot);
 
-  const runningJob = sortJobsNewestFirst(listJobs(workspaceRoot)).find(
+  const runningJob = listJobs(workspaceRoot).find(
     (job) => isActiveJobStatus(job.status) && !isJobStalled(job) && !job.stopGate
   );
   const runningTaskNote = runningJob
@@ -153,7 +156,31 @@ async function main() {
     return;
   }
 
-  if (!binaryAvailable("agy", ["--version"], { cwd }).available) {
+  // From here the gate is on: any failure blocks with its cause rather than
+  // exiting non-zero, which Claude Code would treat as permission to stop.
+  try {
+    await runGate({ input, cwd, workspaceRoot, runningTaskNote });
+  } catch (error) {
+    emitDecision({
+      decision: "block",
+      reason: [
+        runningTaskNote,
+        `The Gemini review gate failed: ${shortenDetail(error instanceof Error ? error.message : String(error))}. Run /gemini:review --wait manually, or disable the gate with /gemini:setup --disable-review-gate.`
+      ].filter(Boolean).join(" ")
+    });
+  }
+}
+
+async function runGate({ input, cwd, workspaceRoot, runningTaskNote }) {
+  // Nothing changed since the last stop the gate allowed: no Gemini call.
+  const fingerprint = repoFingerprint(cwd);
+  const baseline = readGateBaseline(workspaceRoot);
+  if (fingerprint?.digest && baseline?.digest && fingerprint.head === baseline.head && fingerprint.digest === baseline.digest) {
+    logNote(runningTaskNote);
+    return;
+  }
+
+  if (!binaryAvailable(agyCommand(), ["--version"], { cwd }).available) {
     emitDecision({
       decision: "block",
       reason: [
@@ -164,7 +191,21 @@ async function main() {
     return;
   }
 
-  const review = runStopReview(cwd, input);
+  const changes = fingerprint
+    ? describeChangesSince(fingerprint.repoRoot, baseline?.head ?? null, { attach: (text) => writeGateChanges(workspaceRoot, text) })
+    : { text: "", complete: true, missing: [] };
+  // Gemini cannot run git here, so it must not allow on evidence it never got.
+  if (!changes.complete) {
+    emitDecision({
+      decision: "block",
+      reason: [
+        runningTaskNote,
+        `The Gemini review gate cannot hand over these changes (too large, or the attachment could not be written): ${changes.missing.join("; ")}. Review them with /gemini:review, or disable the gate with /gemini:setup --disable-review-gate.`
+      ].filter(Boolean).join(" ")
+    });
+    return;
+  }
+  const review = runStopReview(cwd, input, changes.text);
   if (!review.ok) {
     emitDecision({
       decision: "block",
@@ -173,6 +214,9 @@ async function main() {
     return;
   }
 
+  if (fingerprint) {
+    writeGateBaseline(workspaceRoot, { head: fingerprint.head, digest: fingerprint.digest, allowedAt: new Date().toISOString() });
+  }
   logNote(runningTaskNote);
 }
 

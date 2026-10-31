@@ -32,6 +32,8 @@ If you installed 1.x from `m-ghalib/gemini-plugin-cc`, which still runs the reti
 
 Version 2.0 replaced Google's Gemini CLI, whose consumer service ended in June 2026, with `agy`. The `/gemini:*` command names are unchanged.
 
+On Windows the plugin runs `git`, `taskkill` and `agy.exe` directly, without a shell, so it does not depend on Git Bash or `cmd.exe` quoting. It has not yet been run on Windows: only macOS is verified.
+
 ## Commands
 
 | Command | Purpose |
@@ -77,13 +79,15 @@ Without `--wait`, reviews and longer tasks run as Claude background tasks. Claud
 
 `/gemini:review [--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [focus …]`
 
-The plugin collects the diff (the working tree when it is dirty, otherwise the branch against its base) and sends it to `agy` in read-only plan mode with the review schema passed as `--json-schema`, so `agy` validates the result. Diffs up to 256 KB and 25 files go inline; larger ones are summarized and Gemini reads the files itself with read-only git commands. Exit code 10 means the review has findings.
+The plugin collects the diff (the working tree when it is dirty, otherwise the branch against its base) and sends it to `agy` as a read-only run (see below) with the review schema passed as `--json-schema`, so `agy` validates the result. Diffs up to 256 KB and 25 files go inline, untracked file contents included. Larger diffs are written to a file in the job folder that Gemini reads with its `read_file` tool, and untracked files are listed by path and size. Exit code 10 means the review has findings.
+
+Read-only runs (reviews, the stop-time gate, and `--plan` tasks) pass `agy` a `--settings` deny list for every write, edit, shell command and MCP call, plus `--sandbox`. `agy` refuses those calls itself, so read-only does not depend on the prompt.
 
 ### `/gemini:rescue`
 
 | Flag | Effect |
 |---|---|
-| `--plan` | Read-only run. Without it, Gemini may edit files, with `agy --sandbox` restricting its terminal commands |
+| `--plan` | Read-only run: `agy` refuses writes, edits, shell commands and MCP calls. Without it, Gemini may edit files, with `agy --sandbox` restricting its terminal commands |
 | `--resume` | Continue the last Gemini conversation (`agy --conversation`) |
 | `--model <id>` | Any model `agy models` lists; default is `agy`'s own |
 | `--effort low\|medium\|high\|xhigh\|max` | Reasoning effort, passed to `agy` |
@@ -115,7 +119,7 @@ Jobs are stored per repository under Claude Code's plugin data directory: the la
 
 `/gemini:setup --enable-review-gate` adds a review of Claude's last turn before each stop. Gemini answers `ALLOW` or `BLOCK`; a block, or a failure to reach Gemini, keeps Claude working with the reason. The gate runs once per stop: when Claude continues because of a block, the next stop is not reviewed again, so a persistent block cannot loop. Gate runs are read-only and never become `--resume` targets. Disable it with `/gemini:setup --disable-review-gate`.
 
-The gate sees Claude's last message and the repository state, not a per-turn diff, so it cannot perfectly separate this turn's edits from earlier ones.
+Before calling Gemini, the gate fingerprints the repository (HEAD, `git status`, the staged and unstaged diffs, and untracked files' contents, or size and time for files over 1 MiB). If nothing changed since the last stop it allowed, it lets Claude stop without calling Gemini at all. Otherwise Gemini gets Claude's last message plus the changes since that stop as labelled parts (commits, staged, unstaged), so it judges what changed instead of exploring the repository. Up to 128 KB goes inline; larger changes go to a file Gemini reads. If the changes cannot be handed over, or the gate itself fails, it blocks rather than letting Claude stop unreviewed.
 
 ## How it works
 
@@ -124,7 +128,9 @@ Claude Code ──Bash──▶ gemini-companion.mjs ──stdin (one NDJSON mes
             ◀─answer + footer─            ◀──stream events + terminal result──
 ```
 
-The companion writes the task to `agy`'s stdin, never to its argument list, so prompts of any size and content are safe. It reads `agy`'s stream events, records the conversation id as soon as `agy` reports it, and treats a denied action, an empty response, a non-success status, or `agy`'s own timeout as a failure. The `agy` flags and event shapes it relies on are pinned by a live contract test (`npm run test:live`).
+The companion writes the task to `agy`'s stdin, never to its argument list, so prompts of any size and content are safe. It reads `agy`'s stream events, records the conversation id as soon as `agy` reports it, and treats a denied action, an empty response, a non-success status, or `agy`'s own timeout as a failure. The job log names every tool call and, for a failed one, the target and `agy`'s reason. The `agy` flags and event shapes it relies on are pinned by a live contract test (`npm run test:live`).
+
+`/gemini:setup --verify` runs one minimal read-only turn and reports what `agy` loads into every call on your machine: its input tokens and the number of tools it offers the model.
 
 ## Development
 

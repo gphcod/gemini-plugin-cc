@@ -20,7 +20,7 @@ Read the context and trace the highest-risk paths first.
 Note any invariants the change relies on, then check whether the change actually preserves them.
 Where the diff is small or self-contained, be decisive about whether it is safe.
 Where the diff touches shared state, persistence, auth, or failure handling, dig into second-order effects.
-This is a read-only review: you may read files and run read-only git commands for context, but never modify the workspace.
+This is a read-only review: read files with read_file for context. Shell commands, edits and MCP tools are disabled for this run.
 {{REVIEW_COLLECTION_GUIDANCE}}
 </review_method>
 

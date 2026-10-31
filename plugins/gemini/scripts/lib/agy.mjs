@@ -8,15 +8,20 @@
 // behaviour relied on here; re-run it after each agy upgrade and keep
 // tests/fixtures/fake-agy.mjs in step with it.
 //
-// Verified against agy 1.4.12: `--mode plan` is read-only for one-shot runs
-// but is ignored when `--disable-slash-commands` is set, so plan runs leave
-// slash expansion enabled while write runs disable it. When its own
-// --print-timeout fires, agy still exits 0 with status SUCCESS and marks the
-// result `finished_reason: "print_timeout"`; that is treated as incomplete.
+// Verified against agy 1.4.12: read-only runs are enforced by --settings
+// deny rules, which make agy refuse every write, edit, shell command and MCP
+// call; a refused call fails as a tool step and the run still answers, with
+// result.denied_actions left empty. `--mode plan` is not used: it is only a
+// prompt, it is ignored when --disable-slash-commands is set, and dropping it
+// changed a trivial turn's input by 23 tokens. When its own --print-timeout fires, agy still
+// exits 0 with status SUCCESS and marks the result
+// `finished_reason: "print_timeout"`; that is treated as incomplete.
 
 import { spawn } from "node:child_process";
 import path from "node:path";
 import process from "node:process";
+
+import { shorten } from "./render.mjs";
 
 const MAX_FRAME_BYTES = 32 * 1024 * 1024;
 const MAX_PARTIAL_BYTES = 32 * 1024 * 1024;
@@ -32,20 +37,19 @@ export function agyCommand(platform = process.platform) {
   return platform === "win32" ? "agy.exe" : "agy";
 }
 
+export const READ_ONLY_SETTINGS = JSON.stringify({
+  permissions: { deny: ["write_file(*)", "edit_file(*)", "command(*)", "mcp(*)"] }
+});
+
 export function buildLaunchDescription(options) {
   const timeoutSeconds = Number(options.timeoutSeconds) > 0 ? Number(options.timeoutSeconds) : DEFAULT_TIMEOUT_SECONDS;
-  const mode = options.mode === "plan" ? "plan" : "accept-edits";
   const args = [
     "--input-format", "stream-json",
     "--output-format", "stream-json",
-    "--mode", mode,
+    "--disable-slash-commands",
+    "--mode", "accept-edits",
     "--print-timeout", `${timeoutSeconds.toLocaleString("en-US", { useGrouping: false, maximumFractionDigits: 20 })}s`
   ];
-  // agy ignores --mode plan while slash expansion is disabled, so only
-  // write-capable runs disable slash commands.
-  if (mode !== "plan") {
-    args.splice(4, 0, "--disable-slash-commands");
-  }
   for (const key of ["model", "effort", "conversation"]) {
     if (options[key] != null && options[key] !== "") {
       args.push(`--${key}`, String(options[key]));
@@ -54,19 +58,18 @@ export function buildLaunchDescription(options) {
   if (options.jsonSchemaPath) {
     args.push("--json-schema", options.jsonSchemaPath);
   }
-  if (options.sandbox) {
+  if (options.readOnly) {
+    args.push("--settings", READ_ONLY_SETTINGS);
+  }
+  if (options.readOnly || options.sandbox) {
     args.push("--sandbox");
   }
-  // Plan runs keep slash expansion on (see above), so a task that starts with
-  // "/" (a path, say) is prefixed to keep it from being read as a command.
-  const task = String(options.task ?? "");
-  const content = mode === "plan" && task.trimStart().startsWith("/") ? `Task: ${task}` : task;
   return {
     command: agyCommand(),
     args,
     cwd: options.cwd ?? process.cwd(),
     timeoutSeconds,
-    input: `${JSON.stringify({ event: "user", message: { content } })}\n`
+    input: `${JSON.stringify({ event: "user", message: { content: String(options.task ?? "") } })}\n`
   };
 }
 
@@ -104,6 +107,28 @@ export function launchFailure(error, command) {
 
 export function isDeniedFailure(result) {
   return Boolean(Array.isArray(result?.denied_actions) && result.denied_actions.length);
+}
+
+// The tool name plus its main argument (a path, command, query or URL), so
+// the job log says what Gemini touched, e.g. "read_file /repo/tests/x.mjs".
+export function describeToolStep(step) {
+  const name = step.tool_name ?? step.tool_info?.name ?? "unknown tool";
+  const parameters = step.tool_info?.parameters;
+  let target = "";
+  if (parameters && typeof parameters === "object") {
+    const entries = Object.entries(parameters).filter(([, value]) => typeof value === "string" && value.trim());
+    const preferred = entries.find(([key]) => /path|file|command|query|url|pattern|dir/i.test(key)) ?? entries[0];
+    target = preferred ? shorten(preferred[1], 160) : "";
+  }
+  return target ? `${name} ${target}` : name;
+}
+
+// agy streams a failed tool step as state ERROR with the reason in
+// tool_info.error.message, not in a top-level error field.
+export function describeStepError(step) {
+  const reason = step.tool_info?.error?.message ?? step.error?.message ?? step.error ?? "no reason given";
+  const subject = step.step_type === "tool" || step.tool_name || step.tool_info ? describeToolStep(step) : step.step_type ?? "step";
+  return `failed: ${subject} — ${shorten(reason, 200)}`;
 }
 
 // Runs one agy turn. Returns { ok, result, error, partial, conversationId,

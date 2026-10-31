@@ -87,7 +87,9 @@ function tokenizeWithOffsets(raw) {
       escaping = false;
       continue;
     }
-    if (character === "\\") {
+    // As in POSIX shells, a backslash inside single quotes is literal, which
+    // keeps Windows paths such as 'C:\work\plan.md' intact.
+    if (character === "\\" && quote !== "'") {
       if (start === -1) start = index;
       escaping = true;
       continue;

@@ -1,6 +1,6 @@
 {
   "name": "gemini-plugin-cc",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "private": true,
   "type": "module",
   "description": "Use Gemini from Claude Code through the Antigravity CLI (agy) to review code or delegate tasks.",

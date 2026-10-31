@@ -6,9 +6,14 @@ For example, the output of /gemini:setup or /gemini:status does not count.
 If the previous Claude turn was only a status update, a summary, a setup/login check, a review result, or output from a command that did not itself make direct edits, return ALLOW immediately and do no further work.
 When reviewing, focus on the files and changes described in the previous response rather than the full cumulative repo state.
 Challenge whether the identified work and its design choices should ship.
+This run is read-only and cannot execute commands: use the repository changes below as primary evidence, and read files by path when you need more context. When there is no earlier allowed stop, the latest commit is included because the previous turn may have made it; use Claude's response to judge whether it did.
 
 {{CLAUDE_RESPONSE_BLOCK}}
 </task>
+
+<repository_changes>
+{{REPO_CHANGES_BLOCK}}
+</repository_changes>
 
 <compact_output_contract>
 Return a compact final answer.
@@ -26,7 +31,7 @@ Use BLOCK only if the previous turn made code changes and you found something th
 
 <grounding_rules>
 Ground every blocking claim in the repository context or tool outputs you inspected during this run.
-Do not treat the previous Claude response as proof that code changes happened; verify that from the repository state before you block.
+Do not treat the previous Claude response as proof that code changes happened; verify that from the repository changes before you block.
 Do not block based on older edits from earlier turns when the immediately previous turn did not itself make direct edits.
 Note: the repository state reflects cumulative changes across all turns, not just this one. Use the previous Claude response text to identify which files were likely modified in this specific turn, then focus your review on those files. When in doubt about attribution, prefer ALLOW over blocking on work from earlier turns.
 </grounding_rules>

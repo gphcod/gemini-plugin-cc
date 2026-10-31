@@ -40,11 +40,11 @@ test("an unknown flag makes agy exit non-zero", options, () => {
   assert.notEqual(result.status, 0);
 });
 
-test("a plan turn: init first, terminal result with matching conversation id, resumable", options, async () => {
+test("a read-only turn: init first, terminal result with matching conversation id, resumable", options, async () => {
   const cwd = workspace();
   const events = [];
   const first = await runAgy(
-    { task: "Remember the code word PLUM-7731. Reply with exactly: noted", cwd, mode: "plan", timeoutSeconds: 120 },
+    { task: "Remember the code word PLUM-7731. Reply with exactly: noted", cwd, readOnly: true, timeoutSeconds: 120 },
     { onEvent: (event) => events.push(event) }
   );
   assert.equal(first.ok, true, `${first.error} / response: ${JSON.stringify(first.result?.response)}`);
@@ -58,7 +58,7 @@ test("a plan turn: init first, terminal result with matching conversation id, re
   assert.ok(events.some((event) => event.event === "step_update" && event.step_update.step_type === "agent_response"));
 
   const second = await runAgy(
-    { task: "What was the code word? Reply with only the word.", cwd, mode: "plan", conversation: first.conversationId, timeoutSeconds: 120 },
+    { task: "What was the code word? Reply with only the word.", cwd, readOnly: true, conversation: first.conversationId, timeoutSeconds: 120 },
     {}
   );
   assert.equal(second.ok, true, second.error);
@@ -66,10 +66,40 @@ test("a plan turn: init first, terminal result with matching conversation id, re
   assert.match(second.result.response, /PLUM-7731/, `resumed turn answered: ${JSON.stringify(second.result.response)}`);
 });
 
-test("plan mode is read-only; write mode with the sandbox can edit", options, async () => {
+test("a failed tool step streams its reason in tool_info.error.message", options, async () => {
   const cwd = workspace();
-  await runAgy({ task: "Create a file named plan-probe.txt containing hello.", cwd, mode: "plan", timeoutSeconds: 120 }, {});
-  assert.equal(fs.existsSync(path.join(cwd, "plan-probe.txt")), false, "plan mode must not write to the workspace");
+  const steps = [];
+  const outcome = await runAgy(
+    { task: "Use your read_file tool on the path /nonexistent-dir/missing-file.txt, then reply with exactly: done", cwd, readOnly: true, timeoutSeconds: 120 },
+    { onEvent: (event) => { if (event.event === "step_update") steps.push(event.step_update); } }
+  );
+  assert.equal(outcome.ok, true, outcome.error);
+  const failed = steps.find((step) => step.state === "ERROR" && step.step_type === "tool");
+  assert.ok(failed, `no failed tool step among: ${steps.map((step) => `${step.step_type}/${step.state}`).join(", ")}`);
+  assert.equal(failed.tool_name, "read_file");
+  assert.equal(typeof failed.tool_info?.error?.message, "string", JSON.stringify(failed));
+  assert.match(failed.tool_info.parameters.Path, /missing-file\.txt/);
+});
+
+test("read-only settings deny writes and commands but keep reads, and write mode can edit", options, async () => {
+  const cwd = workspace();
+  const outside = makeTempDir("agy-contract-outside-");
+  fs.writeFileSync(path.join(outside, "review.diff"), "DIFF-FILE-MARKER-7731\n");
+  const steps = [];
+  const readOnly = await runAgy(
+    {
+      task: `Do every step even if one fails: 1) read_file ${path.join(outside, "review.diff")}  2) run the command: ls  3) create a file ro-probe.txt containing hi. Then reply with the marker text from step 1, or NONE.`,
+      cwd,
+      readOnly: true,
+      timeoutSeconds: 180
+    },
+    { onEvent: (event) => { if (event.event === "step_update" && event.step_update.step_type === "tool") steps.push(event.step_update); } }
+  );
+  assert.equal(readOnly.ok, true, readOnly.error);
+  assert.match(readOnly.result.response, /DIFF-FILE-MARKER-7731/, "a file outside the repository is readable");
+  assert.equal(fs.existsSync(path.join(cwd, "ro-probe.txt")), false, "read-only runs must not write");
+  const refused = steps.filter((step) => step.state === "ERROR").map((step) => step.tool_info?.error?.message ?? "");
+  assert.ok(refused.some((message) => /permission check failed/.test(message)), `refusals: ${JSON.stringify(refused)}`);
 
   const write = await runAgy(
     { task: "Create a file named write-probe.txt containing the single word hello, then reply with exactly: done", cwd, sandbox: true, timeoutSeconds: 180 },
@@ -100,7 +130,7 @@ test("review through the companion returns schema-validated JSON from --json-sch
 test("a turn cut by the timeout is reported as incomplete", options, async () => {
   const cwd = workspace();
   const outcome = await runAgy(
-    { task: "Write a 4000-word essay on the history of compilers.", cwd, mode: "plan", timeoutSeconds: 3 },
+    { task: "Write a 4000-word essay on the history of compilers.", cwd, readOnly: true, timeoutSeconds: 3 },
     {}
   );
   assert.equal(outcome.ok, false);
@@ -112,7 +142,7 @@ test("aborting a running turn ends agy's whole process group", { ...options, ski
   const controller = new AbortController();
   let pid = null;
   const run = runAgy(
-    { task: "Write a 4000-word essay on the history of compilers.", cwd, mode: "plan", timeoutSeconds: 120 },
+    { task: "Write a 4000-word essay on the history of compilers.", cwd, readOnly: true, timeoutSeconds: 120 },
     {
       signal: controller.signal,
       onSpawn: (spawned) => { pid = spawned; },
