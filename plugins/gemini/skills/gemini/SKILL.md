@@ -26,6 +26,12 @@ EOF
 )"
 ```
 
+No Bash tool: never put text in a PowerShell command. Write the flags and text to a new UTF-8 temp file outside the repository, then in PowerShell:
+
+```powershell
+node "${CLAUDE_PLUGIN_ROOT}/scripts/gemini-companion.mjs" task "--args-file=<file>"; exit $LASTEXITCODE
+```
+
 Run small asks in the foreground with Bash `timeout: 600000`. Run reviews and anything longer with `run_in_background: true` and end the turn: completion arrives as a notification. Never poll status in a loop.
 
 Output: the answer, then one footer `gemini ok · job k3f9 · 41s`. Past 24 KiB the answer is cut and the footer adds `full: <file>`. Exit 0 ok, 10 review has findings, 20 agy denied an action, 1 failure, 2 usage.

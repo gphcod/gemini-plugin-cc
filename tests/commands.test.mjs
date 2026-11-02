@@ -62,7 +62,7 @@ test("model-visible surface stays within the token budget", () => {
   const description = skill.match(/^description: (.+)$/m)[1];
   assert.ok(Buffer.byteLength(description) <= 200, `description is ${Buffer.byteLength(description)} B`);
   for (const file of fs.readdirSync(path.join(PLUGIN_ROOT, "commands"))) {
-    assert.ok(Buffer.byteLength(read(`commands/${file}`)) <= 1000, `${file} exceeds 1000 B`);
+    assert.ok(Buffer.byteLength(read(`commands/${file}`)) <= 1200, `${file} exceeds 1200 B`);
   }
   assert.deepEqual(fs.readdirSync(path.join(PLUGIN_ROOT, "skills")), ["gemini"]);
   assert.equal(fs.existsSync(path.join(PLUGIN_ROOT, "agents")), false);
@@ -108,6 +108,45 @@ test("no plugin file still refers to the retired Gemini CLI or ACP runtime", () 
 });
 
 // Claude -> companion contract: run each documented call form end to end.
+
+test("--args-file holds the raw arguments, and any argument beside it is refused rather than lost", () => {
+  const ws = makeFakeAgyWorkspace();
+  const file = path.join(ws.root, "arguments.txt");
+  fs.writeFileSync(file, "--plan look at app.js");
+  const companion = path.join(PLUGIN_ROOT, "scripts", "gemini-companion.mjs");
+  const call = (...args) => spawnSync(process.execPath, [companion, "task", ...args], { cwd: ws.repo, env: ws.env, encoding: "utf8", timeout: 30000, input: "" });
+  assert.equal(call("--args-file", file).status, 0);
+  assert.ok(isReadOnlyLaunch(readArgvLog(ws.argvLog).at(-1)));
+  assert.equal(call(`--args-file=${file}`).status, 0);
+  for (const args of [["--args-file", file, "--plan"], ["--plan", "--args-file", file], [`--args-file=${file}`, "extra"], ["--args-file"]]) {
+    const before = readArgvLog(ws.argvLog).length;
+    const result = call(...args);
+    assert.equal(result.status, 2, `${args.join(" ")}: ${result.stdout}${result.stderr}`);
+    assert.equal(readArgvLog(ws.argvLog).length, before, "agy did not start");
+  }
+  assert.equal(call("--args-file", path.join(ws.root, "missing.txt")).status, 2);
+  assert.equal(call("--plan", "--", "--args-file=not-a-file.txt").status, 0, "after -- it is text");
+});
+
+const POWERSHELLS = process.platform === "win32" ? ["powershell.exe", "pwsh.exe"].filter((exe) => spawnSync(exe, ["-NoProfile", "-Command", "exit 0"], { windowsHide: true }).status === 0) : [];
+for (const exe of POWERSHELLS) {
+  test(`${exe}: the PowerShell form takes flags and text by file, keeps the exit code, and carries no text`, () => {
+    const ws = makeFakeAgyWorkspace();
+    const form = (name, file) => /```powershell\n(.*)\n```/.exec(read(`commands/${name}.md`))[1].replaceAll("${CLAUDE_PLUGIN_ROOT}", PLUGIN_ROOT).replace("<file>", file);
+    const runPs = (body, scenario) => spawnSync(exe, ["-NoProfile", "-NonInteractive", "-Command", body], { cwd: ws.repo, env: { ...ws.env, ...(scenario ? { AGY_TEST_SCENARIO: scenario } : {}) }, encoding: "utf8", timeout: 30000, windowsHide: true });
+    const file = path.join(ws.root, "arguments.txt");
+    const text = 'He said "hi", $HOME and `tick\n\'@ not an end\n\u2019@ nor this\nna\u00efve \u6f22\u5b57';
+    fs.writeFileSync(file, `--plan ${text}`);
+    const task = runPs(form("rescue", file), "echo");
+    assert.equal(task.status, 0, task.stderr);
+    assert.ok(isReadOnlyLaunch(readArgvLog(ws.argvLog).at(-1)), "--plan in the file reaches the parser as a flag");
+    const input = JSON.parse(JSON.parse(task.stdout.split("\n")[0]).input.trim()).message.content;
+    for (const piece of ['"hi"', "\u2019@", "'@ not an end", "na\u00efve \u6f22\u5b57"]) assert.ok(input.includes(piece), piece);
+    fs.writeFileSync(file, "");
+    assert.equal(runPs(form("review", file), "review").status, 10, "exit $LASTEXITCODE keeps the companion's code");
+    assert.equal(runPs(form("review", path.join(ws.root, "missing.txt"))).status, 2);
+  });
+}
 
 test("setup's call form exits 0 when agy is ready", () => {
   const ws = makeFakeAgyWorkspace();

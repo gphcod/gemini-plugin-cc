@@ -417,8 +417,32 @@ const HANDLERS = {
   cancel: handleCancel
 };
 
+// `<sub> --args-file <path>`: the file holds what the commands otherwise pass as one "$ARGUMENTS" argument.
+// PowerShell mangles quotes on a native argument, and text placed in one of its here-strings can end the string
+// and run as a command, so a PowerShell call never carries the text itself.
+function withArgsFile(args) {
+  const literal = args.indexOf("--"); // What follows `--` is text, even when it looks like this option.
+  const at = (literal === -1 ? args : args.slice(0, literal)).findIndex((arg) => arg === "--args-file" || arg.startsWith("--args-file="));
+  if (at === -1) return args;
+  const inline = args[at].startsWith("--args-file=") ? args[at].slice("--args-file=".length) : null;
+  const extra = args.length - (inline === null ? 2 : 1);
+  // A flag beside the file would be lost, and a lost --plan would turn a read-only run into one that can edit.
+  if (at !== 0 || extra !== 0) throw new UsageError("--args-file must be the only argument after the subcommand; put every flag in the file.");
+  return [readArgsFile(inline ?? args[1])];
+}
+
+function readArgsFile(file) {
+  if (!file) throw new UsageError("--args-file needs a path");
+  try {
+    return fs.readFileSync(file, "utf8").replace(/^\uFEFF/, "");
+  } catch (error) {
+    throw new UsageError(`Cannot read --args-file ${file}: ${error.code ?? error.message}`);
+  }
+}
+
 async function main() {
-  const [subcommand, ...argv] = process.argv.slice(2);
+  const [subcommand, ...args] = process.argv.slice(2);
+  const argv = withArgsFile(args);
   if (!subcommand || subcommand === "help" || subcommand === "--help") {
     printUsage();
     return;
