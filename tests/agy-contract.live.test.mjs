@@ -70,7 +70,7 @@ test("a failed tool step streams its reason in tool_info.error.message", options
   const cwd = workspace();
   const steps = [];
   const outcome = await runAgy(
-    { task: "Use your read_file tool on the path /nonexistent-dir/missing-file.txt, then reply with exactly: done", cwd, readOnly: true, timeoutSeconds: 120 },
+    { task: "Use your read_file tool on the path missing-file.txt in the current directory, then reply with exactly: done", cwd, readOnly: true, timeoutSeconds: 120 },
     { onEvent: (event) => { if (event.event === "step_update") steps.push(event.step_update); } }
   );
   assert.equal(outcome.ok, true, outcome.error);
@@ -91,12 +91,13 @@ test("read-only settings deny writes and commands but keep reads, and write mode
       task: `Do every step even if one fails: 1) read_file ${path.join(outside, "review.diff")}  2) run the command: ls  3) create a file ro-probe.txt containing hi. Then reply with the marker text from step 1, or NONE.`,
       cwd,
       readOnly: true,
+      readPaths: [path.join(outside, "review.diff")],
       timeoutSeconds: 180
     },
     { onEvent: (event) => { if (event.event === "step_update" && event.step_update.step_type === "tool") steps.push(event.step_update); } }
   );
   assert.equal(readOnly.ok, true, readOnly.error);
-  assert.match(readOnly.result.response, /DIFF-FILE-MARKER-7731/, "a file outside the repository is readable");
+  assert.match(readOnly.result.response, /DIFF-FILE-MARKER-7731/, "a named file outside the repository is readable");
   assert.equal(fs.existsSync(path.join(cwd, "ro-probe.txt")), false, "read-only runs must not write");
   const refused = steps.filter((step) => step.state === "ERROR").map((step) => step.tool_info?.error?.message ?? "");
   assert.ok(refused.some((message) => /permission check failed/.test(message)), `refusals: ${JSON.stringify(refused)}`);

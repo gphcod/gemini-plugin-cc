@@ -169,9 +169,13 @@ export function writeGateBaseline(cwd, baseline) {
 }
 
 // A stop-gate diff too large to inline, attached as a file for Gemini to read.
+export function gateChangesPath(cwd) {
+  return path.join(resolveStateDir(cwd), "gate-changes.diff");
+}
+
 export function writeGateChanges(cwd, text) {
   ensureStateDir(cwd);
-  const file = path.join(resolveStateDir(cwd), "gate-changes.diff");
+  const file = gateChangesPath(cwd);
   writeFileAtomic(file, String(text ?? ""));
   return file;
 }
