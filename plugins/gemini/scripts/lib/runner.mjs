@@ -21,6 +21,7 @@ import {
   patchJobRecord,
   removeJobRecord,
   writeAnswerFile,
+  gateChangesPath,
   writeJobDiff,
   writeJobRecord
 } from "./state.mjs";
@@ -213,7 +214,9 @@ export async function executeTaskRun(request, progress, turn) {
       cwd: request.workspaceRoot,
       timeoutSeconds: request.timeoutSeconds,
       sandbox: request.sandbox,
-      readOnly: request.readOnly
+      readOnly: request.readOnly,
+      // The stop gate's oversized changes, when its prompt points at them.
+      readPaths: request.readOnly ? [gateChangesPath(request.workspaceRoot)] : []
     },
     turnCallbacks(request, progress, turn)
   );
@@ -297,6 +300,7 @@ export async function executeReviewRun(request, progress, turn) {
       cwd: context.repoRoot,
       timeoutSeconds: request.timeoutSeconds,
       readOnly: true,
+      readPaths: [diffFile],
       jsonSchemaPath: path.join(request.rootDir, "schemas", "review-output.schema.json")
     },
     turnCallbacks(request, progress, turn)

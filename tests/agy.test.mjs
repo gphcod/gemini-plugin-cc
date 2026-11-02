@@ -1,5 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import process from "node:process";
 import { spawn } from "node:child_process";
 
@@ -13,7 +16,9 @@ import {
   isDeniedFailure,
   READ_ONLY_SETTINGS,
   resultFailure,
-  runAgy
+  runAgy,
+  agyEnv,
+  readOnlySettings
 } from "../plugins/gemini/scripts/lib/agy.mjs";
 
 function fakeSpawn(scenario, extraEnv = {}) {
@@ -192,4 +197,31 @@ test("a missing executable gives the install hint", async () => {
   );
   assert.equal(outcome.ok, false);
   assert.ok(outcome.error.includes(AGY_INSTALL_HINT));
+});
+
+test("agy's PWD is the real directory, so its workspace root matches the paths it resolves", { skip: process.platform === "win32" && "agy reads no PWD there" }, () => {
+  const real = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "agy-pwd-")));
+  const link = `${real}-link`;
+  fs.symlinkSync(real, link);
+  try {
+    assert.equal(agyEnv(link, { PWD: link, KEEP: "1" }).PWD, real);
+    assert.equal(agyEnv(link, { PWD: link, KEEP: "1" }).KEEP, "1");
+    const missing = { PWD: "/nowhere" };
+    assert.equal(agyEnv(path.join(real, "missing"), missing), missing);
+    assert.equal(agyEnv(link, missing, "win32"), missing);
+  } finally {
+    fs.rmSync(link);
+    fs.rmSync(real, { recursive: true });
+  }
+});
+
+test("a read-only run may read the files its prompt names, and no others", () => {
+  assert.equal(readOnlySettings(), READ_ONLY_SETTINGS);
+  assert.equal(readOnlySettings([null]), READ_ONLY_SETTINGS);
+  assert.equal(readOnlySettings(["/nowhere/odd (name).diff"]), READ_ONLY_SETTINGS, "a parenthesis would break the rule");
+  const settings = JSON.parse(readOnlySettings(["/nowhere/job.diff"]));
+  assert.deepEqual(settings.permissions.allow, ["read_file(/nowhere/job.diff)"]);
+  assert.deepEqual(settings.permissions.deny, JSON.parse(READ_ONLY_SETTINGS).permissions.deny);
+  const launch = buildLaunchDescription({ task: "t", readOnly: true, readPaths: ["/nowhere/job.diff"] });
+  assert.match(launch.args[launch.args.indexOf("--settings") + 1], /read_file\(\/nowhere\/job\.diff\)/);
 });

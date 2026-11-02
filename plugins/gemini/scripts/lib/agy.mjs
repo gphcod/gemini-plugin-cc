@@ -18,6 +18,7 @@
 // `finished_reason: "print_timeout"`; that is treated as incomplete.
 
 import { spawn } from "node:child_process";
+import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 
@@ -50,6 +51,27 @@ export const READ_ONLY_SETTINGS = JSON.stringify({
   permissions: { deny: ["write_file(*)", "edit_file(*)", "command(*)", "mcp(*)"] }
 });
 
+// A prompt can name a diff file in the plugin's state directory, outside the workspace, where
+// headless agy denies read_file unless a rule allows that path. A path with a parenthesis cannot be
+// written as a rule, so it stays denied.
+export function readOnlySettings(readPaths = []) {
+  const allow = readPaths
+    .filter(Boolean)
+    .map((file) => {
+      try {
+        return fs.realpathSync.native(file);
+      } catch {
+        return file;
+      }
+    })
+    .filter((file) => !/[()\r\n\0]/.test(file))
+    .map((file) => `read_file(${file})`);
+  if (!allow.length) return READ_ONLY_SETTINGS;
+  const settings = JSON.parse(READ_ONLY_SETTINGS);
+  settings.permissions.allow = allow;
+  return JSON.stringify(settings);
+}
+
 export function buildLaunchDescription(options) {
   const timeoutSeconds = Number(options.timeoutSeconds) > 0 ? Number(options.timeoutSeconds) : DEFAULT_TIMEOUT_SECONDS;
   const invocation = agyInvocation();
@@ -70,7 +92,7 @@ export function buildLaunchDescription(options) {
     args.push("--json-schema", options.jsonSchemaPath);
   }
   if (options.readOnly) {
-    args.push("--settings", READ_ONLY_SETTINGS);
+    args.push("--settings", readOnlySettings(options.readPaths));
   }
   if (options.readOnly || options.sandbox) {
     args.push("--sandbox");
@@ -147,6 +169,17 @@ export function describeStepError(step) {
 // (including the terminal result) so callers can log progress and record the
 // conversation id as soon as `init` arrives. `onStderr` receives raw agy
 // diagnostics chunks.
+// agy takes its workspace root from PWD as spelled; reached through a symlink (/tmp on macOS), every
+// resolved path falls outside it and headless agy denies the tool.
+export function agyEnv(cwd, env = process.env, platform = process.platform) {
+  if (platform === "win32") return env;
+  try {
+    return { ...env, PWD: fs.realpathSync.native(cwd) };
+  } catch {
+    return env;
+  }
+}
+
 export async function runAgy(options, { spawnImpl = spawn, signal, onEvent, onStderr, onSpawn } = {}) {
   const launch = buildLaunchDescription(options);
   if (signal?.aborted) {
@@ -157,7 +190,7 @@ export async function runAgy(options, { spawnImpl = spawn, signal, onEvent, onSt
   try {
     child = spawnImpl(launch.command, launch.args, {
       cwd: launch.cwd,
-      env: process.env,
+      env: agyEnv(launch.cwd),
       shell: false,
       windowsHide: true,
       detached: process.platform !== "win32",
