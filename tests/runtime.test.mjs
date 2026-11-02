@@ -35,7 +35,7 @@ function cleanupAfter(t, ws, child) {
     try { child.kill("SIGKILL"); } catch {}
     for (const job of jobsFor(ws)) {
       if (job.agyPid) {
-        try { process.kill(-job.agyPid, "SIGKILL"); } catch {}
+        try { process.kill(process.platform === "win32" ? job.agyPid : -job.agyPid, "SIGKILL"); } catch {}
       }
     }
   });
@@ -232,7 +232,7 @@ test("result exits 0 even for a review with findings", () => {
   assert.match(result.stdout, /Example finding/);
 });
 
-test("cancel stops a running task, kills agy, and the job stays cancelled", { skip: process.platform === "win32", timeout: 30000 }, async (t) => {
+test("cancel stops a running task, kills agy, and the job stays cancelled", { timeout: 30000 }, async (t) => {
   const ws = makeFakeAgyWorkspace();
   const companion = spawnCompanion(["task", "long", "job"], { cwd: ws.repo, env: ws.env, scenario: "hang" });
   cleanupAfter(t, ws, companion);
@@ -263,7 +263,7 @@ test("concurrent calls sharing a --request-id start agy once and all get its res
   }
 });
 
-test("cancel kills agy's process group even after the companion died", { skip: process.platform === "win32", timeout: 30000 }, async (t) => {
+test("cancel kills agy's process group even after the companion died", { timeout: 30000 }, async (t) => {
   const ws = makeFakeAgyWorkspace();
   const childPidFile = path.join(ws.root, "grandchild.pid");
   const companion = spawnCompanion(["task", "orphan", "me"], {
@@ -277,7 +277,7 @@ test("cancel kills agy's process group even after the companion died", { skip: p
   const grandchild = Number(await waitFor(() => fs.existsSync(childPidFile) && fs.readFileSync(childPidFile, "utf8")));
   companion.kill("SIGKILL");
   await exited;
-  assert.ok(isAlive(grandchild), "the orphaned agy tree survives its companion");
+  if (process.platform !== "win32") assert.ok(isAlive(grandchild), "the orphaned agy tree survives its companion"); // Windows ends it with its hard-killed parent.
 
   const cancel = runCompanion(["cancel", job.handle], { cwd: ws.repo, env: ws.env });
   assert.equal(cancel.status, 0, cancel.stderr);
@@ -296,7 +296,7 @@ function markCancelledDirectly(ws, jobId) {
   }
 }
 
-test("the companion consumes a cancel marker mid-run even when nothing signals it", { skip: process.platform === "win32", timeout: 30000 }, async (t) => {
+test("the companion consumes a cancel marker mid-run even when nothing signals it", { timeout: 30000 }, async (t) => {
   const ws = makeFakeAgyWorkspace();
   const companion = spawnCompanion(["task", "long"], { cwd: ws.repo, env: ws.env, scenario: "hang" });
   cleanupAfter(t, ws, companion);
@@ -309,7 +309,7 @@ test("the companion consumes a cancel marker mid-run even when nothing signals i
   assert.equal(jobsFor(ws).find((entry) => entry.id === job.id).status, "cancelled");
 });
 
-test("a job cancelled before agy launches never launches it", { skip: process.platform === "win32", timeout: 30000 }, async (t) => {
+test("a job cancelled before agy launches never launches it", { skip: process.platform === "win32" && "stands in for git with a sh script, which Windows cannot run without a shell", timeout: 30000 }, async (t) => {
   const ws = makeFakeAgyWorkspace({ slowGitSeconds: 1 });
   const companion = spawnCompanion(["review"], { cwd: ws.repo, env: ws.env, scenario: "hang" });
   cleanupAfter(t, ws, companion);

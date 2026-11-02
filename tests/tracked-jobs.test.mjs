@@ -39,7 +39,7 @@ test("log helpers append timestamped lines and blocks, and skip empty input", ()
   assert.match(lines[2], /\] Final output$/);
   assert.equal(lines[3], "answer");
   assert.equal(lines.length, 4);
-  assert.equal(fs.statSync(logFile).mode & 0o777, 0o600);
+  if (process.platform !== "win32") assert.equal(fs.statSync(logFile).mode & 0o777, 0o600); // Windows has no such mode bits.
 });
 
 test("createJobRecord stamps a creation time without dropping fields", () => {

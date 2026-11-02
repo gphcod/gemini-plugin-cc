@@ -72,6 +72,15 @@ test("terminateProcessTree falls back to the pid when it does not lead a process
   assert.equal(outcome.method, "process");
 });
 
+test("terminateProcessTree judges a failed Windows taskkill by the process, whatever language it answers in", () => {
+  const localized = () => ({ status: 128, stdout: "", stderr: "Fehler: Der Prozess wurde nicht gefunden.", error: null });
+  const gone = terminateProcessTree(1234, { platform: "win32", runCommandImpl: localized, isAliveImpl: () => false });
+  assert.deepEqual([gone.attempted, gone.delivered], [true, false]);
+  assert.throws(() => terminateProcessTree(1234, { platform: "win32", runCommandImpl: localized, isAliveImpl: () => true }));
+  const denied = () => ({ status: 1, stdout: "", stderr: "Zugriff verweigert.", error: null });
+  assert.throws(() => terminateProcessTree(1234, { platform: "win32", runCommandImpl: denied, isAliveImpl: () => false }), "a failed tree kill still fails");
+});
+
 test("terminateProcessTree treats missing Windows processes as already stopped", () => {
   const outcome = terminateProcessTree(1234, {
     platform: "win32",

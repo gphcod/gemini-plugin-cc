@@ -1,6 +1,6 @@
 // Live contract between the companion and the real Antigravity CLI. Skipped
 // unless AGY_E2E=1; each case makes a small paid model call. Run before every
-// release and after every agy upgrade: `AGY_E2E=1 npm run test:live`.
+// release and after every agy upgrade: `npm run test:live`.
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";

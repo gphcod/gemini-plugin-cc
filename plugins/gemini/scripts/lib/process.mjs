@@ -107,7 +107,9 @@ export function terminateProcessTree(pid, options = {}) {
     }
 
     const combinedOutput = `${result.stderr}\n${result.stdout}`.trim();
-    if (!result.error && looksLikeMissingProcessMessage(combinedOutput)) {
+    // taskkill localizes its messages, but exit 128 with the process gone means not found in any language.
+    const goneAnyLanguage = result.status === 128 && !(options.isAliveImpl ?? isPidAlive)(pid);
+    if (!result.error && (looksLikeMissingProcessMessage(combinedOutput) || goneAnyLanguage)) {
       return { attempted: true, delivered: false, method: "taskkill", result };
     }
 

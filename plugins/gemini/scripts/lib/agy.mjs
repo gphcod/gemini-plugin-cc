@@ -37,13 +37,24 @@ export function agyCommand(platform = process.platform) {
   return platform === "win32" ? "agy.exe" : "agy";
 }
 
+// What runs agy: GEMINI_AGY_BIN if set (a .mjs entry through this node), else the
+// native binary on PATH. Nothing here goes through a shell, so a stand-in for
+// agy on Windows has to be named this way.
+export function agyInvocation(env = process.env, platform = process.platform) {
+  const override = env.GEMINI_AGY_BIN;
+  if (!override) return { command: agyCommand(platform), args: [] };
+  return override.endsWith(".mjs") ? { command: process.execPath, args: [override] } : { command: override, args: [] };
+}
+
 export const READ_ONLY_SETTINGS = JSON.stringify({
   permissions: { deny: ["write_file(*)", "edit_file(*)", "command(*)", "mcp(*)"] }
 });
 
 export function buildLaunchDescription(options) {
   const timeoutSeconds = Number(options.timeoutSeconds) > 0 ? Number(options.timeoutSeconds) : DEFAULT_TIMEOUT_SECONDS;
+  const invocation = agyInvocation();
   const args = [
+    ...invocation.args,
     "--input-format", "stream-json",
     "--output-format", "stream-json",
     "--disable-slash-commands",
@@ -65,7 +76,7 @@ export function buildLaunchDescription(options) {
     args.push("--sandbox");
   }
   return {
-    command: agyCommand(),
+    command: invocation.command,
     args,
     cwd: options.cwd ?? process.cwd(),
     timeoutSeconds,

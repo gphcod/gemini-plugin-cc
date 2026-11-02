@@ -1,6 +1,6 @@
 {
   "name": "gemini",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "description": "Use Gemini from Claude Code through the Antigravity CLI (agy) to review code or delegate tasks.",
   "author": {
     "name": "Momin Abrar Ghalib"

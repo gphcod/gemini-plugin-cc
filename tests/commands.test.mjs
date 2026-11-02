@@ -21,9 +21,17 @@ function inlineCommand(source) {
   return source.match(/^!`(.+)`$/m)?.[1] ?? null;
 }
 
+// Git for Windows puts only git.exe on PATH outside Git Bash; its sh.exe sits at a fixed place below that.
+function posixShell() {
+  if (process.platform !== "win32") return "/bin/sh";
+  const execPath = (spawnSync("git", ["--exec-path"], { encoding: "utf8" }).stdout ?? "").trim();
+  const bundled = path.resolve(execPath, "..", "..", "..", "bin", "sh.exe");
+  return fs.existsSync(bundled) ? bundled : "sh.exe";
+}
+
 function runClaudeForm(line, ws, { args = "", scenario } = {}) {
   const command = line.replaceAll("${CLAUDE_PLUGIN_ROOT}", PLUGIN_ROOT).replaceAll("$ARGUMENTS", args);
-  return spawnSync("/bin/sh", ["-c", command], {
+  return spawnSync(posixShell(), ["-c", command], {
     cwd: ws.repo,
     env: { ...ws.env, ...(scenario ? { AGY_TEST_SCENARIO: scenario } : {}) },
     encoding: "utf8",

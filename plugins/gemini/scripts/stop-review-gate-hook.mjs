@@ -10,7 +10,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-import { agyCommand } from "./lib/agy.mjs";
+import { agyInvocation } from "./lib/agy.mjs";
 import { describeChangesSince, repoFingerprint } from "./lib/git.mjs";
 import { binaryAvailable } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
@@ -180,7 +180,8 @@ async function runGate({ input, cwd, workspaceRoot, runningTaskNote }) {
     return;
   }
 
-  if (!binaryAvailable(agyCommand(), ["--version"], { cwd }).available) {
+  const agyBin = agyInvocation();
+  if (!binaryAvailable(agyBin.command, [...agyBin.args, "--version"], { cwd }).available) {
     emitDecision({
       decision: "block",
       reason: [
