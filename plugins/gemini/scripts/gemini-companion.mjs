@@ -11,7 +11,7 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
-import { agyCommand, DEFAULT_TIMEOUT_SECONDS } from "./lib/agy.mjs";
+import { agyInvocation, DEFAULT_TIMEOUT_SECONDS } from "./lib/agy.mjs";
 import { parseArgs, parseProseCommand, splitRawArgumentString } from "./lib/args.mjs";
 import { readStdinIfPiped, STDIN_INACTIVITY_MS, StdinTimeoutError } from "./lib/fs.mjs";
 import { resolveReviewTarget } from "./lib/git.mjs";
@@ -125,7 +125,8 @@ function resolveCommandCwd(options = {}) {
 // --- setup ------------------------------------------------------------------
 
 function getAgyAuthStatus(cwd) {
-  const probe = runCommand(agyCommand(), ["models"], { cwd, timeout: 30000 });
+  const agyBin = agyInvocation();
+  const probe = runCommand(agyBin.command, [...agyBin.args, "models"], { cwd, timeout: 30000 });
   if (probe.error && probe.error.code === "ENOENT") {
     return { loggedIn: false, detail: "agy is not installed" };
   }
@@ -161,7 +162,8 @@ async function handleSetup(argv) {
   }
 
   const node = binaryAvailable(process.execPath, ["--version"], { cwd });
-  const agy = binaryAvailable(agyCommand(), ["--version"], { cwd });
+  const agyBin = agyInvocation();
+  const agy = binaryAvailable(agyBin.command, [...agyBin.args, "--version"], { cwd });
   const auth = agy.available ? getAgyAuthStatus(cwd) : { loggedIn: false, detail: "agy is not installed" };
   const report = {
     ready: node.available && agy.available && auth.loggedIn,
@@ -379,7 +381,14 @@ async function handleCancel(argv) {
   // heartbeat went quiet is not signalled: its pid may now belong to another
   // process.
   const companionFresh = job.pid != null && Date.now() - Date.parse(job.heartbeatAt ?? "") <= 30_000;
-  const companionKill = companionFresh ? terminateProcessTree(job.pid) : { attempted: false, delivered: false };
+  let companionKill = { attempted: false, delivered: false };
+  try {
+    if (companionFresh) companionKill = terminateProcessTree(job.pid);
+  } catch (error) {
+    // The cancel marker is written and agy still has to be stopped below.
+    companionKill = { attempted: true, delivered: false };
+    try { appendLogLine(job.logFile, `Could not signal the companion: ${error.message}`); } catch {}
+  }
   let agyKill = { attempted: false, delivered: false };
   if (job.agyPid != null && job.agyPid !== job.pid) {
     agyKill = await stopProcessGroup(job.agyPid);

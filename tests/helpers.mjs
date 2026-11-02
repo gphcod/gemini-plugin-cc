@@ -32,7 +32,7 @@ export function run(command, args, options = {}) {
     env: options.env,
     encoding: "utf8",
     input: options.input,
-    shell: process.platform === "win32" && !path.isAbsolute(command),
+    shell: false,
     windowsHide: true
   });
 }
@@ -79,6 +79,8 @@ export function makeFakeAgyWorkspace({ withAgy = true, slowGitSeconds = 0 } = {}
     AGY_TEST_ARGV_LOG: argvLog
   };
   delete env.AGY_TEST_SCENARIO;
+  // Windows cannot run the sh stand-in, and PATH would find the real agy.exe.
+  if (process.platform === "win32") env.GEMINI_AGY_BIN = withAgy ? FAKE_AGY : path.join(bin, "no-agy.exe");
   return { root, repo, bin, data, env, argvLog };
 }
 

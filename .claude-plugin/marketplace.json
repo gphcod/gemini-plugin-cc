@@ -6,13 +6,13 @@
   },
   "metadata": {
     "description": "Gemini plugin for Claude Code: code review and delegation through the Antigravity CLI (agy).",
-    "version": "2.1.0"
+    "version": "2.1.1"
   },
   "plugins": [
     {
       "name": "gemini",
       "description": "Use Gemini from Claude Code through the Antigravity CLI (agy) to review code or delegate tasks.",
-      "version": "2.1.0",
+      "version": "2.1.1",
       "author": {
         "name": "Momin Abrar Ghalib"
       },

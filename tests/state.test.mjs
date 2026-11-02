@@ -122,7 +122,7 @@ test("pruning keeps the newest finished jobs and removes their files", () => {
   assert.equal(fs.existsSync(path.join(resolveJobsDir(workspace), "job-00.result.json")), false);
 });
 
-test("pruning never removes an active job, however many newer jobs finished", { skip: process.platform === "win32" }, async () => {
+test("pruning never removes an active job, however many newer jobs finished", async () => {
   const orphan = spawn(process.execPath, ["-e", "setInterval(() => {}, 60000)"], { detached: true, stdio: "ignore" });
   try {
     const workspace = makeTempDir();
@@ -138,7 +138,7 @@ test("pruning never removes an active job, however many newer jobs finished", { 
     assert.equal(orphanJob.stalled, true);
     assert.equal(orphanJob.agyPid, orphan.pid);
   } finally {
-    process.kill(-orphan.pid, "SIGKILL");
+    if (process.platform === "win32") orphan.kill(); else process.kill(-orphan.pid, "SIGKILL");
   }
 });
 
@@ -165,7 +165,7 @@ test("review diff files are written privately and pruned with their job", async 
   const workspace = makeTempDir();
   writeJobRecord(workspace, { id: "review-old", status: "completed" });
   const diffFile = writeJobDiff(workspace, "review-old", "diff --git a b\n");
-  assert.equal(fs.statSync(diffFile).mode & 0o777, 0o600);
+  if (process.platform !== "win32") assert.equal(fs.statSync(diffFile).mode & 0o777, 0o600); // Windows has no such mode bits.
   pruneFinishedJobs(workspace, 0);
   assert.equal(fs.existsSync(diffFile), false);
 });

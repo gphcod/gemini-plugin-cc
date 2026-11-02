@@ -83,15 +83,25 @@ export function ensureStateDir(cwd) {
   ensuredStateDirs.add(stateDir);
 }
 
+// On Windows another process (a reader, often antivirus) can hold a file open for a moment. Elsewhere these errors are permanent.
+const isBusy = (error) => process.platform === "win32" && ["EPERM", "EBUSY", "EACCES"].includes(error?.code);
+const sleepSync = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+
 // Readers never see a torn file: content goes to a temp file, then rename.
 function writeFileAtomic(filePath, data) {
   const tempPath = `${filePath}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
   fs.writeFileSync(tempPath, data, { encoding: "utf8", mode: 0o600 });
-  try {
-    fs.renameSync(tempPath, filePath);
-  } catch (error) {
-    try { fs.unlinkSync(tempPath); } catch {}
-    throw error;
+  for (const deadline = Date.now() + 5000; ;) {
+    try {
+      fs.renameSync(tempPath, filePath);
+      break;
+    } catch (error) {
+      if (!isBusy(error) || Date.now() >= deadline) {
+        try { fs.unlinkSync(tempPath); } catch {}
+        throw error;
+      }
+      sleepSync(10 + Math.floor(Math.random() * 20));
+    }
   }
   try { fs.chmodSync(filePath, 0o600); } catch {}
 }
@@ -113,10 +123,14 @@ function createFileExclusive(filePath, data) {
 }
 
 function readJsonOrNull(filePath) {
-  try {
-    return JSON.parse(fs.readFileSync(filePath, "utf8"));
-  } catch {
-    return null;
+  for (const deadline = Date.now() + 5000; ;) {
+    try {
+      return JSON.parse(fs.readFileSync(filePath, "utf8"));
+    } catch (error) {
+      // A short Windows lock is not a missing record: it waits as long as a write would.
+      if (!isBusy(error) || Date.now() >= deadline) return null;
+      sleepSync(20);
+    }
   }
 }
 

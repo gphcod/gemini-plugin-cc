@@ -23,8 +23,9 @@ import { listJobs, writeJobRecord, writeJobResult } from "../plugins/gemini/scri
 // Runs `fn` with the fake agy first on PATH and the workspace's plugin data,
 // as the companion would see them.
 async function withFakeAgy(ws, scenario, fn) {
-  const saved = { PATH: process.env.PATH, CLAUDE_PLUGIN_DATA: process.env.CLAUDE_PLUGIN_DATA, AGY_TEST_SCENARIO: process.env.AGY_TEST_SCENARIO, AGY_TEST_ARGV_LOG: process.env.AGY_TEST_ARGV_LOG };
+  const saved = { PATH: process.env.PATH, GEMINI_AGY_BIN: process.env.GEMINI_AGY_BIN, CLAUDE_PLUGIN_DATA: process.env.CLAUDE_PLUGIN_DATA, AGY_TEST_SCENARIO: process.env.AGY_TEST_SCENARIO, AGY_TEST_ARGV_LOG: process.env.AGY_TEST_ARGV_LOG };
   Object.assign(process.env, { PATH: ws.env.PATH, CLAUDE_PLUGIN_DATA: ws.data, AGY_TEST_ARGV_LOG: ws.argvLog });
+  if (ws.env.GEMINI_AGY_BIN) process.env.GEMINI_AGY_BIN = ws.env.GEMINI_AGY_BIN;
   if (scenario) process.env.AGY_TEST_SCENARIO = scenario;
   else delete process.env.AGY_TEST_SCENARIO;
   try {

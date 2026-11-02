@@ -104,7 +104,7 @@ test("collectReviewContext skips untracked directories in working tree review", 
   assert.match(context.content, /### \.claude\/worktrees\/agent-test\/\n\(skipped: directory\)/);
 });
 
-test("collectReviewContext skips broken untracked symlinks instead of crashing", () => {
+test("collectReviewContext skips broken untracked symlinks instead of crashing", { skip: process.platform === "win32" && "creating a symlink needs Developer Mode or elevation" }, () => {
   const cwd = makeTempDir();
   initGitRepo(cwd);
   fs.writeFileSync(path.join(cwd, "app.js"), "console.log('v1');\n");
@@ -307,7 +307,7 @@ test("staged and unstaged versions of a file give different fingerprints, with o
 
 test("edits to untracked files with unusual names change the fingerprint", () => {
   const cwd = committedRepo();
-  const name = "tab\there café.txt";
+  const name = process.platform === "win32" ? "space here café.txt" : "tab\there café.txt"; // Windows forbids a tab in a name.
   fs.writeFileSync(path.join(cwd, name), "one\n");
   const first = repoFingerprint(cwd);
   fs.writeFileSync(path.join(cwd, name), "two\n");

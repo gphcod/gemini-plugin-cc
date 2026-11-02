@@ -152,7 +152,7 @@ test("an unwritable attachment blocks the stop without calling Gemini or recordi
   assert.equal(fs.existsSync(path.join(stateDirOf(ws), "gate-baseline.json")), false);
 });
 
-test("an unexpected failure inside the gate blocks instead of letting Claude stop", () => {
+test("an unexpected failure inside the gate blocks instead of letting Claude stop", { skip: process.platform === "win32" && "stands in for git with a sh script, which Windows cannot run without a shell" }, () => {
   const ws = makeFakeAgyWorkspace();
   enableGate(ws);
   const realGit = spawnSync("/bin/sh", ["-c", "command -v git"], { encoding: "utf8" }).stdout.trim();
