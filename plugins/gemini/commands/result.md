@@ -2,7 +2,7 @@
 description: Show the stored output of a finished Gemini job
 argument-hint: '[job]'
 disable-model-invocation: true
-allowed-tools: Bash(node:*)
+allowed-tools: Bash(node:*), PowerShell(node:*)
 ---
 
 !`node "${CLAUDE_PLUGIN_ROOT}/scripts/gemini-companion.mjs" result "$ARGUMENTS"`

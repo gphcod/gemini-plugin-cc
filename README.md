@@ -32,7 +32,7 @@ If you installed 1.x from `m-ghalib/gemini-plugin-cc`, which still runs the reti
 
 Version 2.0 replaced Google's Gemini CLI, whose consumer service ended in June 2026, with `agy`. The `/gemini:*` command names are unchanged.
 
-On Windows the plugin runs `git`, `taskkill` and `agy.exe` directly, without a shell, so it does not depend on Git Bash or `cmd.exe` quoting. Windows 11 is checked with `agy.exe` 1.4.12: the test suite, the live contract tests and the installed plugin.
+Claude Code sessions with no Bash tool (`CLAUDE_CODE_USE_POWERSHELL_TOOL`) use the PowerShell form in each command: the arguments go in a UTF-8 file named by `--args-file`, never in the command. On Windows the plugin runs `git`, `taskkill` and `agy.exe` directly, without a shell, so it does not depend on Git Bash or `cmd.exe` quoting. Windows 11 is checked with `agy.exe` 1.4.12: the test suite, the live contract tests and the installed plugin.
 
 ## Commands
 

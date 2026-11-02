@@ -14,7 +14,11 @@ const COMMANDS_DIR = path.join(ROOT, "plugins", "gemini", "commands");
 const COMPANION = 'node "${CLAUDE_PLUGIN_ROOT}/scripts/gemini-companion.mjs"';
 
 function bashBlock(subcommand) {
-  return ["```bash", `${COMPANION} ${subcommand} "$ARGUMENTS"`, "```"].join("\n");
+  return [
+    "```bash", `${COMPANION} ${subcommand} "$ARGUMENTS"`, "```", "",
+    "No Bash tool: write the arguments verbatim to a new UTF-8 file outside the repo, never into the command, then in PowerShell:", "",
+    "```powershell", `${COMPANION} ${subcommand} "--args-file=<file>"; exit $LASTEXITCODE`, "```"
+  ].join("\n");
 }
 
 function inline(subcommand) {
@@ -43,7 +47,7 @@ export const COMMANDS = [
     description: "Check that the Antigravity CLI (agy) is installed and signed in, and toggle the stop-time review gate",
     argumentHint: "[--verify] [--enable-review-gate|--disable-review-gate]",
     userOnly: true,
-    allowedTools: "Bash(node:*)",
+    allowedTools: "Bash(node:*), PowerShell(node:*), Write",
     body: [
       "Run once with Bash:",
       "",
@@ -57,7 +61,7 @@ export const COMMANDS = [
     description: "Run a Gemini code review of local git changes (working tree or branch diff)",
     argumentHint: "[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [focus ...]",
     userOnly: false,
-    allowedTools: "Bash(node:*)",
+    allowedTools: "Bash(node:*), PowerShell(node:*), Write",
     body: reviewBody("review", "Run a Gemini code review focused on correctness and regression risk.")
   },
   {
@@ -65,7 +69,7 @@ export const COMMANDS = [
     description: "Run a Gemini review that challenges the implementation approach and design choices",
     argumentHint: "[--wait|--background] [--base <ref>] [--scope auto|working-tree|branch] [focus ...]",
     userOnly: false,
-    allowedTools: "Bash(node:*)",
+    allowedTools: "Bash(node:*), PowerShell(node:*), Write",
     body: reviewBody(
       "adversarial-review",
       "Run an adversarial Gemini review that questions the design, its assumptions, and how it fails under real conditions."
@@ -76,7 +80,7 @@ export const COMMANDS = [
     description: "Delegate an investigation, a question, or a fix to Gemini",
     argumentHint: "[--wait|--background] [--resume] [--plan] [--model <m>] [--effort <e>] <task>",
     userOnly: true,
-    allowedTools: "Bash(node:*)",
+    allowedTools: "Bash(node:*), PowerShell(node:*), Write",
     body: [
       "Forward the request to Gemini in one Bash call. If `$ARGUMENTS` has no task text, ask what Gemini should do instead.",
       "`--resume` continues the last Gemini conversation; `--plan` keeps the run read-only.",
@@ -93,7 +97,7 @@ export const COMMANDS = [
     description: "Show active and recent Gemini jobs for this repository",
     argumentHint: "[job] [--all]",
     userOnly: true,
-    allowedTools: "Bash(node:*)",
+    allowedTools: "Bash(node:*), PowerShell(node:*)",
     body: [inline("status"), "", "Show the status above to the user unchanged."].join("\n")
   },
   {
@@ -101,7 +105,7 @@ export const COMMANDS = [
     description: "Show the stored output of a finished Gemini job",
     argumentHint: "[job]",
     userOnly: true,
-    allowedTools: "Bash(node:*)",
+    allowedTools: "Bash(node:*), PowerShell(node:*)",
     body: [
       inline("result"),
       "",
@@ -113,7 +117,7 @@ export const COMMANDS = [
     description: "Cancel an active Gemini job in this repository",
     argumentHint: "[job]",
     userOnly: true,
-    allowedTools: "Bash(node:*)",
+    allowedTools: "Bash(node:*), PowerShell(node:*)",
     body: [inline("cancel"), "", "Report the line above."].join("\n")
   }
 ];
